@@ -1,0 +1,166 @@
+syntax = "proto3";
+
+package node;
+
+option go_package = "github.com/0prodigy/OpenE2B/pkg/proto/node";
+
+// NodeAgent runs on each compute node and manages sandbox lifecycle
+service NodeAgent {
+    // Heartbeat reports node status to control plane
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    
+    // CreateSandbox creates a new sandbox on this node
+    rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
+    
+    // StopSandbox terminates a sandbox
+    rpc StopSandbox(StopSandboxRequest) returns (StopSandboxResponse);
+    
+    // PauseSandbox pauses a sandbox
+    rpc PauseSandbox(PauseSandboxRequest) returns (PauseSandboxResponse);
+    
+    // ResumeSandbox resumes a paused sandbox
+    rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+    
+    // GetSandboxStatus returns the current status of a sandbox
+    rpc GetSandboxStatus(GetSandboxStatusRequest) returns (GetSandboxStatusResponse);
+    
+    // ListSandboxes returns all sandboxes on this node
+    rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+    
+    // PullArtifact downloads and prepares a template artifact
+    rpc PullArtifact(PullArtifactRequest) returns (PullArtifactResponse);
+    
+    // ExecCommand executes a command in a sandbox (for debugging)
+    rpc ExecCommand(ExecCommandRequest) returns (stream ExecCommandResponse);
+}
+
+// Node registration and heartbeat
+message HeartbeatRequest {
+    string node_id = 1;
+    NodeStatus status = 2;
+}
+
+message HeartbeatResponse {
+    bool acknowledged = 1;
+    repeated string pending_actions = 2;
+}
+
+message NodeStatus {
+    string state = 1;  // ready, draining, unhealthy
+    int32 cpu_total = 2;
+    int32 cpu_allocated = 3;
+    int64 memory_total_bytes = 4;
+    int64 memory_allocated_bytes = 5;
+    int32 sandbox_count = 6;
+    repeated string cached_artifacts = 7;
+}
+
+// Sandbox lifecycle
+message CreateSandboxRequest {
+    string sandbox_id = 1;
+    string template_id = 2;
+    string build_id = 3;
+    int32 cpu_count = 4;
+    int32 memory_mb = 5;
+    int32 disk_size_mb = 6;
+    map<string, string> env_vars = 7;
+    map<string, string> metadata = 8;
+    int64 timeout_seconds = 9;
+    bool auto_pause = 10;
+    string envd_token = 11;
+    string artifact_url = 12;  // URL to download rootfs if not cached
+}
+
+message CreateSandboxResponse {
+    bool success = 1;
+    string error = 2;
+    string envd_address = 3;  // IP:port to reach envd
+    int32 envd_port = 4;
+}
+
+message StopSandboxRequest {
+    string sandbox_id = 1;
+    bool force = 2;
+}
+
+message StopSandboxResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message PauseSandboxRequest {
+    string sandbox_id = 1;
+}
+
+message PauseSandboxResponse {
+    bool success = 1;
+    string error = 2;
+    string snapshot_id = 3;  // For resuming later
+}
+
+message ResumeSandboxRequest {
+    string sandbox_id = 1;
+    string snapshot_id = 2;
+}
+
+message ResumeSandboxResponse {
+    bool success = 1;
+    string error = 2;
+    string envd_address = 3;
+}
+
+message GetSandboxStatusRequest {
+    string sandbox_id = 1;
+}
+
+message GetSandboxStatusResponse {
+    bool exists = 1;
+    SandboxInfo sandbox = 2;
+}
+
+message ListSandboxesRequest {}
+
+message ListSandboxesResponse {
+    repeated SandboxInfo sandboxes = 1;
+}
+
+message SandboxInfo {
+    string sandbox_id = 1;
+    string template_id = 2;
+    string build_id = 3;
+    string state = 4;  // starting, running, paused, stopped, error
+    string envd_address = 5;
+    int64 started_at = 6;
+    int64 expires_at = 7;
+    int32 cpu_count = 8;
+    int32 memory_mb = 9;
+    string error = 10;
+}
+
+// Artifact management
+message PullArtifactRequest {
+    string template_id = 1;
+    string build_id = 2;
+    string artifact_url = 3;
+}
+
+message PullArtifactResponse {
+    bool success = 1;
+    string error = 2;
+    string local_path = 3;
+}
+
+// Debugging
+message ExecCommandRequest {
+    string sandbox_id = 1;
+    string command = 2;
+    repeated string args = 3;
+}
+
+message ExecCommandResponse {
+    oneof output {
+        bytes stdout = 1;
+        bytes stderr = 2;
+        int32 exit_code = 3;
+    }
+}

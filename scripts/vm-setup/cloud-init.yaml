@@ -1,0 +1,70 @@
+#cloud-config
+# Cloud-init configuration for E2B compute node
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - docker.io
+  - curl
+  - wget
+  - jq
+  - unzip
+  - build-essential
+
+# Write the node agent script
+write_files:
+  - path: /opt/e2b/agent.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # E2B Node Agent - manages sandboxes on this compute node
+      # This is a placeholder that will be replaced by the Go binary
+      
+      echo "E2B Node Agent starting..."
+      echo "Node ID: $(hostname)"
+      echo "Waiting for control plane connection..."
+      
+      # Keep running
+      while true; do
+        sleep 60
+      done
+
+  - path: /etc/systemd/system/e2b-agent.service
+    content: |
+      [Unit]
+      Description=E2B Node Agent
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=simple
+      ExecStart=/opt/e2b/agent.sh
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  # Add ubuntu user to docker group
+  - usermod -aG docker ubuntu
+  
+  # Create E2B directories
+  - mkdir -p /opt/e2b/artifacts
+  - mkdir -p /opt/e2b/rootfs
+  - mkdir -p /opt/e2b/sandboxes
+  
+  # Enable and start docker
+  - systemctl enable docker
+  - systemctl start docker
+  
+  # Pull base images
+  - docker pull ubuntu:22.04
+  
+  # For future: Download Firecracker (when running on real Linux with KVM)
+  # - curl -L -o /usr/local/bin/firecracker https://github.com/firecracker-microvm/firecracker/releases/download/v1.5.0/firecracker-v1.5.0-aarch64.tgz
+  
+  # Start agent (disabled for now, will be started manually)
+  # - systemctl enable e2b-agent
+  # - systemctl start e2b-agent
