@@ -15,10 +15,13 @@ import (
 
 // DockerRuntime implements SandboxRuntime using Docker containers
 type DockerRuntime struct {
-	artifactsDir string
-	sandboxesDir string
-	sandboxes    map[string]*dockerSandbox
-	mu           sync.RWMutex
+	artifactsDir   string
+	sandboxesDir   string
+	sandboxes      map[string]*dockerSandbox
+	mu             sync.RWMutex
+	nextPort       int32
+	availablePorts []int32
+	envdBinaryPath string
 }
 
 type dockerSandbox struct {
@@ -31,17 +34,71 @@ type dockerSandbox struct {
 
 // NewDockerRuntime creates a new Docker-based runtime
 func NewDockerRuntime(artifactsDir, sandboxesDir string) *DockerRuntime {
+	// Try to find the envd binary
+	envdPath := findEnvdBinary()
+	if envdPath != "" {
+		log.Printf("[docker-runtime] Using envd binary: %s", envdPath)
+	} else {
+		log.Printf("[docker-runtime] Warning: envd binary not found, sandboxes will run without envd")
+	}
+
 	return &DockerRuntime{
-		artifactsDir: artifactsDir,
-		sandboxesDir: sandboxesDir,
-		sandboxes:    make(map[string]*dockerSandbox),
+		artifactsDir:   artifactsDir,
+		sandboxesDir:   sandboxesDir,
+		sandboxes:      make(map[string]*dockerSandbox),
+		nextPort:       49983, // Start port allocation from default envd port
+		availablePorts: []int32{},
+		envdBinaryPath: envdPath,
 	}
 }
 
+// findEnvdBinary looks for the envd binary in common locations
+func findEnvdBinary() string {
+	paths := []string{
+		"/opt/e2b/bin/envd",
+		"./bin/envd-linux-amd64",
+		"./bin/envd",
+		"./envd-linux-amd64",
+		"./envd",
+		"/usr/local/bin/envd",
+	}
+
+	for _, p := range paths {
+		cmd := exec.Command("test", "-f", p)
+		if err := cmd.Run(); err == nil {
+			return p
+		}
+	}
+
+	return ""
+}
+
+// allocatePort returns an available port for a new sandbox
+func (r *DockerRuntime) allocatePort() int32 {
+	// Try to reuse an available port first
+	if len(r.availablePorts) > 0 {
+		port := r.availablePorts[0]
+		r.availablePorts = r.availablePorts[1:]
+		return port
+	}
+	// Otherwise allocate a new port
+	port := r.nextPort
+	r.nextPort++
+	return port
+}
+
+// releasePort returns a port to the available pool
+func (r *DockerRuntime) releasePort(port int32) {
+	r.availablePorts = append(r.availablePorts, port)
+}
+
 func (r *DockerRuntime) CreateSandbox(ctx context.Context, spec *SandboxSpec) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	// Determine the image to use
 	image := fmt.Sprintf("e2b/%s:%s", spec.TemplateID, spec.BuildID)
-	
+
 	// Check if image exists locally
 	checkCmd := exec.CommandContext(ctx, "docker", "image", "inspect", image)
 	if err := checkCmd.Run(); err != nil {
@@ -50,9 +107,9 @@ func (r *DockerRuntime) CreateSandbox(ctx context.Context, spec *SandboxSpec) er
 		image = "ubuntu:22.04"
 	}
 
-	// Find an available port for envd (49983 is the default, but we need to map it)
-	envdPort := int32(49983)
-	
+	// Allocate a unique port for envd
+	envdPort := r.allocatePort()
+
 	// Build docker run arguments
 	args := []string{
 		"run", "-d",
@@ -70,7 +127,7 @@ func (r *DockerRuntime) CreateSandbox(ctx context.Context, spec *SandboxSpec) er
 		args = append(args, fmt.Sprintf("-m=%dm", spec.MemoryMB))
 	}
 
-	// Port mapping for envd
+	// Port mapping for envd - use allocated port on host, map to 49983 inside container
 	args = append(args, "-p", fmt.Sprintf("%d:49983", envdPort))
 
 	// Environment variables
@@ -94,12 +151,12 @@ func (r *DockerRuntime) CreateSandbox(ctx context.Context, spec *SandboxSpec) er
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		r.releasePort(envdPort)
 		return fmt.Errorf("docker run failed: %s: %w", string(output), err)
 	}
 
-	// Track the sandbox
+	// Track the sandbox (already holding lock from function start)
 	now := time.Now()
-	r.mu.Lock()
 	r.sandboxes[spec.SandboxID] = &dockerSandbox{
 		spec:      spec,
 		state:     "running",
@@ -107,13 +164,67 @@ func (r *DockerRuntime) CreateSandbox(ctx context.Context, spec *SandboxSpec) er
 		expiresAt: now.Add(spec.Timeout),
 		envdPort:  envdPort,
 	}
-	r.mu.Unlock()
 
-	log.Printf("Sandbox %s created successfully", spec.SandboxID)
+	log.Printf("Sandbox %s created successfully on port %d", spec.SandboxID, envdPort)
+
+	// Inject and start envd if binary is available
+	if r.envdBinaryPath != "" {
+		if err := r.injectAndStartEnvd(ctx, spec.SandboxID, spec.EnvdToken); err != nil {
+			log.Printf("[docker-runtime] Warning: failed to start envd in sandbox %s: %v", spec.SandboxID, err)
+			// Don't fail the sandbox creation, envd is optional for basic operations
+		}
+	}
+
+	return nil
+}
+
+// injectAndStartEnvd copies the envd binary into the container and starts it
+func (r *DockerRuntime) injectAndStartEnvd(ctx context.Context, sandboxID, envdToken string) error {
+	// Copy envd binary into container
+	copyCmd := exec.CommandContext(ctx, "docker", "cp", r.envdBinaryPath, fmt.Sprintf("%s:/usr/local/bin/envd", sandboxID))
+	if out, err := copyCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to copy envd binary: %s: %w", string(out), err)
+	}
+
+	// Make it executable
+	chmodCmd := exec.CommandContext(ctx, "docker", "exec", sandboxID, "chmod", "+x", "/usr/local/bin/envd")
+	if out, err := chmodCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to chmod envd: %s: %w", string(out), err)
+	}
+
+	// Start envd in the background
+	startArgs := []string{
+		"exec", "-d", sandboxID,
+		"/bin/sh", "-c",
+		fmt.Sprintf("E2B_ACCESS_TOKEN=%s E2B_ENVD_PORT=49983 /usr/local/bin/envd > /var/log/envd.log 2>&1",
+			envdToken),
+	}
+
+	startCmd := exec.CommandContext(ctx, "docker", startArgs...)
+	if out, err := startCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to start envd: %s: %w", string(out), err)
+	}
+
+	// Give envd a moment to start
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify envd is running by checking the process
+	checkCmd := exec.CommandContext(ctx, "docker", "exec", sandboxID, "pgrep", "-f", "envd")
+	if err := checkCmd.Run(); err != nil {
+		// Try to get the log for debugging
+		logCmd := exec.CommandContext(ctx, "docker", "exec", sandboxID, "cat", "/var/log/envd.log")
+		logOut, _ := logCmd.Output()
+		return fmt.Errorf("envd not running, log: %s", string(logOut))
+	}
+
+	log.Printf("[docker-runtime] envd started in sandbox %s on port 49983", sandboxID)
 	return nil
 }
 
 func (r *DockerRuntime) StopSandbox(ctx context.Context, sandboxID string, force bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	args := []string{"rm"}
 	if force {
 		args = append(args, "-f")
@@ -126,9 +237,11 @@ func (r *DockerRuntime) StopSandbox(ctx context.Context, sandboxID string, force
 		return fmt.Errorf("docker rm failed: %s: %w", string(output), err)
 	}
 
-	r.mu.Lock()
+	// Release the port back to the pool
+	if sb, ok := r.sandboxes[sandboxID]; ok {
+		r.releasePort(sb.envdPort)
+	}
 	delete(r.sandboxes, sandboxID)
-	r.mu.Unlock()
 
 	return nil
 }

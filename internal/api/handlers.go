@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/0prodigy/OpenE2B/internal/build"
-	"github.com/0prodigy/OpenE2B/internal/orchestrator"
+	"github.com/0prodigy/OpenE2B/internal/scheduler"
 )
 
 // BuildService interface for build operations
@@ -29,7 +29,7 @@ type Handler struct {
 	config       *Config
 	buildService BuildService
 	fileStorage  FileStorage
-	scheduler    *orchestrator.Scheduler
+	scheduler    *scheduler.Scheduler
 }
 
 // Config holds server configuration
@@ -57,9 +57,9 @@ func (h *Handler) SetFileStorage(storage FileStorage) {
 	h.fileStorage = storage
 }
 
-// SetScheduler sets the orchestrator scheduler for sandbox operations
-func (h *Handler) SetScheduler(scheduler *orchestrator.Scheduler) {
-	h.scheduler = scheduler
+// SetScheduler sets the scheduler for sandbox operations
+func (h *Handler) SetScheduler(sched *scheduler.Scheduler) {
+	h.scheduler = sched
 }
 
 // writeJSON writes a JSON response
@@ -157,7 +157,7 @@ func (h *Handler) CreateSandbox(w http.ResponseWriter, r *http.Request) {
 			timeout = *req.Timeout
 		}
 
-		spec := orchestrator.SandboxSpec{
+		spec := scheduler.SandboxSpec{
 			ID:         record.SandboxID,
 			TemplateID: record.TemplateID,
 			BuildID:    templateRec.BuildID,

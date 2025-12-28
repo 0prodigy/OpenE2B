@@ -1,3 +1,11 @@
+// Package main implements the Orchestrator daemon.
+//
+// The Orchestrator runs on each compute node and manages sandbox lifecycle
+// using Docker or Firecracker runtimes. It communicates with the Control Plane
+// (API Server + Scheduler) via gRPC.
+//
+// This is the renamed version of the former "node-agent" component, aligned
+// with E2B BYOC terminology.
 package main
 
 import (
@@ -22,6 +30,7 @@ func main() {
 	// Configuration flags
 	nodeID := flag.String("node-id", "", "Unique node identifier")
 	listenAddr := flag.String("listen", ":9000", "gRPC listen address")
+	edgeAddr := flag.String("edge-listen", ":8080", "Edge controller listen address for SDK traffic")
 	controlPlane := flag.String("control-plane", "", "Control plane URL for registration")
 	artifactsDir := flag.String("artifacts-dir", "/opt/e2b/artifacts", "Directory for template artifacts")
 	sandboxesDir := flag.String("sandboxes-dir", "/opt/e2b/sandboxes", "Directory for sandbox data")
@@ -35,9 +44,10 @@ func main() {
 		*nodeID = fmt.Sprintf("node-%s-%d", hostname, time.Now().Unix())
 	}
 
-	log.Printf("Starting E2B Node Agent...")
+	log.Printf("Starting E2B Orchestrator (Node Daemon)...")
 	log.Printf("  Node ID: %s", *nodeID)
-	log.Printf("  Listen: %s", *listenAddr)
+	log.Printf("  gRPC Listen: %s", *listenAddr)
+	log.Printf("  Edge Controller: %s", *edgeAddr)
 	log.Printf("  Runtime: %s", *runtimeMode)
 	log.Printf("  Artifacts: %s", *artifactsDir)
 	log.Printf("  Sandboxes: %s", *sandboxesDir)
@@ -46,7 +56,7 @@ func main() {
 	os.MkdirAll(*artifactsDir, 0755)
 	os.MkdirAll(*sandboxesDir, 0755)
 
-	// Create the node agent
+	// Create the orchestrator agent
 	agentConfig := agent.Config{
 		NodeID:       *nodeID,
 		ArtifactsDir: *artifactsDir,
@@ -55,16 +65,16 @@ func main() {
 		ControlPlane: *controlPlane,
 	}
 
-	nodeAgent, err := agent.New(agentConfig)
+	orchestratorAgent, err := agent.New(agentConfig)
 	if err != nil {
-		log.Fatalf("Failed to create node agent: %v", err)
+		log.Fatalf("Failed to create orchestrator agent: %v", err)
 	}
 
 	// Set up HTTP mux for Connect
 	mux := http.NewServeMux()
 
-	// Register the NodeAgent service
-	path, handler := nodeconnect.NewNodeAgentHandler(nodeAgent, connect.WithInterceptors())
+	// Register the NodeAgent service (gRPC interface for control plane)
+	path, handler := nodeconnect.NewNodeAgentHandler(orchestratorAgent, connect.WithInterceptors())
 	mux.Handle(path, handler)
 
 	// Health check endpoint
@@ -79,17 +89,31 @@ func main() {
 		Handler: h2c.NewHandler(mux, &http2.Server{}),
 	}
 
-	// Start server in background
+	// Start gRPC server in background
 	go func() {
 		log.Printf("gRPC server listening on %s", *listenAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server failed: %v", err)
+			log.Fatalf("gRPC server failed: %v", err)
+		}
+	}()
+
+	// Start Edge Controller for SDK traffic routing
+	edgeController := agent.NewEdgeController(orchestratorAgent.GetRuntime())
+	edgeServer := &http.Server{
+		Addr:    *edgeAddr,
+		Handler: edgeController,
+	}
+
+	go func() {
+		log.Printf("Edge Controller listening on %s", *edgeAddr)
+		if err := edgeServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Edge controller failed: %v", err)
 		}
 	}()
 
 	// Start heartbeat if control plane is configured
 	if *controlPlane != "" {
-		go nodeAgent.StartHeartbeat(context.Background())
+		go orchestratorAgent.StartHeartbeat(context.Background())
 	}
 
 	// Wait for shutdown signal
@@ -102,8 +126,10 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	// Shutdown both servers
 	server.Shutdown(ctx)
-	nodeAgent.Shutdown()
+	edgeServer.Shutdown(ctx)
+	orchestratorAgent.Shutdown()
 
 	log.Println("Shutdown complete")
 }

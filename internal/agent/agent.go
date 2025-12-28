@@ -72,16 +72,16 @@ type ExecOutput struct {
 
 // Agent implements the NodeAgent gRPC service
 type Agent struct {
-	config   Config
-	runtime  SandboxRuntime
-	mu       sync.RWMutex
-	stopCh   chan struct{}
+	config  Config
+	runtime SandboxRuntime
+	mu      sync.RWMutex
+	stopCh  chan struct{}
 }
 
 // New creates a new node agent
 func New(config Config) (*Agent, error) {
 	var runtime SandboxRuntime
-	
+
 	switch config.RuntimeMode {
 	case "docker":
 		runtime = NewDockerRuntime(config.ArtifactsDir, config.SandboxesDir)
@@ -101,6 +101,11 @@ func New(config Config) (*Agent, error) {
 // Shutdown stops the agent
 func (a *Agent) Shutdown() {
 	close(a.stopCh)
+}
+
+// GetRuntime returns the sandbox runtime for use by the edge controller
+func (a *Agent) GetRuntime() SandboxRuntime {
+	return a.runtime
 }
 
 // StartHeartbeat sends periodic heartbeats to the control plane
@@ -124,7 +129,7 @@ func (a *Agent) StartHeartbeat(ctx context.Context) {
 // Heartbeat implements the gRPC Heartbeat method
 func (a *Agent) Heartbeat(ctx context.Context, req *connect.Request[pb.HeartbeatRequest]) (*connect.Response[pb.HeartbeatResponse], error) {
 	log.Printf("Received heartbeat from node: %s", req.Msg.NodeId)
-	
+
 	return connect.NewResponse(&pb.HeartbeatResponse{
 		Acknowledged:   true,
 		PendingActions: []string{},
@@ -292,7 +297,7 @@ func (a *Agent) PullArtifact(ctx context.Context, req *connect.Request[pb.PullAr
 	// For now, just try to pull the docker image
 	// In production, this would download the rootfs artifact
 	imageRef := fmt.Sprintf("e2b/%s:%s", req.Msg.TemplateId, req.Msg.BuildId)
-	
+
 	cmd := exec.CommandContext(ctx, "docker", "pull", imageRef)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		// If pull fails, the image might be local-only

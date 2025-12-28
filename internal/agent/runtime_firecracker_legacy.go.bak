@@ -1,0 +1,1230 @@
+package agent
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// FirecrackerRuntime implements SandboxRuntime using Firecracker microVMs
+// This is the production runtime for running on Linux hosts with KVM support
+type FirecrackerRuntime struct {
+	artifactsDir   string
+	sandboxesDir   string
+	sandboxes      map[string]*firecrackerSandbox
+	mu             sync.RWMutex
+	kernelPath     string
+	envdBinaryPath string
+
+	// Bridge-based networking configuration
+	// All VMs share a single bridge (fcbr0) with subnet 192.168.128.0/24
+	// Host is 192.168.128.1, VMs get 192.168.128.2, .3, .4, etc.
+	bridgeName    string
+	bridgeIP      string
+	bridgeSubnet  string            // CIDR notation: 192.168.128.0/24
+	bridgeCreated bool
+
+	// IP allocation within the bridge subnet
+	// VMs get IPs starting from .2 (host is .1)
+	networkMu   sync.Mutex
+	usedIPs     map[byte]bool     // Tracks which last octet values are in use
+	ipByVM      map[string]byte   // Maps sandbox ID to its IP last octet
+}
+
+type firecrackerSandbox struct {
+	spec       *SandboxSpec
+	state      string
+	socketPath string
+	rootfsPath string
+	startedAt  time.Time
+	expiresAt  time.Time
+	envdPort   int32
+	pid        int
+	tapDevice  string
+	vmIP       string
+	hostPort   int32 // Port forwarded on host for envd access
+}
+
+// NewFirecrackerRuntime creates a new Firecracker-based runtime
+func NewFirecrackerRuntime(artifactsDir, sandboxesDir string) *FirecrackerRuntime {
+	// Try to find the envd binary
+	envdPath := findEnvdBinary()
+	if envdPath != "" {
+		log.Printf("[firecracker-runtime] Using envd binary: %s", envdPath)
+	} else {
+		log.Printf("[firecracker-runtime] Warning: envd binary not found")
+	}
+
+	return &FirecrackerRuntime{
+		artifactsDir:   artifactsDir,
+		sandboxesDir:   sandboxesDir,
+		sandboxes:      make(map[string]*firecrackerSandbox),
+		kernelPath:     "/opt/e2b/vmlinux",
+		envdBinaryPath: envdPath,
+		nextSubnet:     100, // Start from 192.168.100.x
+		usedSubnets:    make(map[byte]bool),
+		subnetByVM:     make(map[string]byte),
+	}
+}
+
+// allocateSubnet returns an available subnet for a new VM
+// Each VM gets its own /24 subnet: 192.168.{subnet}.0/24
+// Host gets .1, VM gets .2, gateway is .1
+func (r *FirecrackerRuntime) allocateSubnet(sandboxID string) (hostIP, vmIP, gateway string, subnet byte, err error) {
+	r.networkMu.Lock()
+	defer r.networkMu.Unlock()
+
+	// Find next available subnet (100-254)
+	for s := byte(100); s < 255; s++ {
+		if !r.usedSubnets[s] {
+			r.usedSubnets[s] = true
+			r.subnetByVM[sandboxID] = s
+			hostIP = fmt.Sprintf("192.168.%d.1", s)
+			vmIP = fmt.Sprintf("192.168.%d.2", s)
+			gateway = hostIP // Host is the gateway
+			return hostIP, vmIP, gateway, s, nil
+		}
+	}
+
+	return "", "", "", 0, fmt.Errorf("no available subnets")
+}
+
+// releaseSubnet releases a subnet when VM is destroyed
+func (r *FirecrackerRuntime) releaseSubnet(sandboxID string) {
+	r.networkMu.Lock()
+	defer r.networkMu.Unlock()
+
+	if subnet, ok := r.subnetByVM[sandboxID]; ok {
+		delete(r.usedSubnets, subnet)
+		delete(r.subnetByVM, sandboxID)
+	}
+}
+
+func (r *FirecrackerRuntime) CreateSandbox(ctx context.Context, spec *SandboxSpec) error {
+	// Check if Firecracker is available
+	if _, err := exec.LookPath("firecracker"); err != nil {
+		return fmt.Errorf("firecracker not found in PATH - are you on a Linux host with KVM?")
+	}
+
+	// Check KVM availability
+	if _, err := os.Stat("/dev/kvm"); os.IsNotExist(err) {
+		return fmt.Errorf("/dev/kvm not available - KVM is required for Firecracker")
+	}
+
+	// Check kernel exists
+	if _, err := os.Stat(r.kernelPath); os.IsNotExist(err) {
+		return fmt.Errorf("kernel not found at %s", r.kernelPath)
+	}
+
+	// Allocate network resources - each VM gets its own /24 subnet
+	hostIP, vmIP, gateway, subnet, err := r.allocateSubnet(spec.SandboxID)
+	if err != nil {
+		return fmt.Errorf("failed to allocate subnet: %w", err)
+	}
+
+	// Create sandbox directory
+	sandboxDir := filepath.Join(r.sandboxesDir, spec.SandboxID)
+	if err := os.MkdirAll(sandboxDir, 0755); err != nil {
+		r.releaseSubnet(spec.SandboxID)
+		return fmt.Errorf("failed to create sandbox directory: %w", err)
+	}
+
+	// Create TAP device for this VM with unique subnet
+	tapDevice := fmt.Sprintf("tap-%s", spec.SandboxID[:8])
+	if err := r.createTapDevice(ctx, tapDevice, hostIP, vmIP, subnet); err != nil {
+		r.releaseSubnet(spec.SandboxID)
+		os.RemoveAll(sandboxDir)
+		return fmt.Errorf("failed to create TAP device: %w", err)
+	}
+
+	// Prepare rootfs with network config
+	vmRootfs := filepath.Join(sandboxDir, "rootfs.ext4")
+	if err := r.prepareRootfs(ctx, spec, vmRootfs, vmIP, gateway); err != nil {
+		r.cleanupTapDevice(ctx, tapDevice)
+		r.releaseSubnet(spec.SandboxID)
+		os.RemoveAll(sandboxDir)
+		return fmt.Errorf("failed to prepare rootfs: %w", err)
+	}
+
+	// Generate unique MAC address based on subnet
+	macAddr := fmt.Sprintf("AA:FC:00:00:00:%02X", subnet)
+
+	// Create Firecracker socket
+	socketPath := filepath.Join(sandboxDir, "firecracker.sock")
+
+	// Calculate host port for envd access (49983 + offset based on subnet)
+	hostPort := int32(49983) + int32(subnet) - 100
+
+	// Create Firecracker config
+	configPath := filepath.Join(sandboxDir, "config.json")
+	config := r.generateConfig(spec, vmRootfs, tapDevice, macAddr)
+	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+		r.cleanupTapDevice(ctx, tapDevice)
+		r.releaseSubnet(spec.SandboxID)
+		os.RemoveAll(sandboxDir)
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+
+	// NOTE: Port forwarding is no longer needed since Edge Controller runs on the same
+	// host and can access VMs directly via their unique subnet IPs
+
+	// Start Firecracker
+	// IMPORTANT: Use background context for the process - we don't want the VM to be
+	// killed when the gRPC request context completes. The VM should run independently.
+	logFile, _ := os.Create(filepath.Join(sandboxDir, "firecracker.log"))
+	cmd := exec.Command("firecracker",
+		"--api-sock", socketPath,
+		"--config-file", configPath,
+	)
+	cmd.Dir = sandboxDir
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+
+	if err := cmd.Start(); err != nil {
+		r.cleanupTapDevice(ctx, tapDevice)
+		r.releaseSubnet(spec.SandboxID)
+		os.RemoveAll(sandboxDir)
+		return fmt.Errorf("failed to start firecracker: %w", err)
+	}
+
+	// Wait for VM to boot and envd to start
+	// Use a background context with its own timeout - we don't want the request context
+	// cancellation to interrupt the health check
+	envdCtx, envdCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer envdCancel()
+	if err := r.waitForEnvd(envdCtx, vmIP, 49983, 30*time.Second); err != nil {
+		log.Printf("[firecracker-runtime] Warning: envd not responding: %v", err)
+		// Don't fail - VM might still be booting
+	}
+
+	// Add /etc/hosts entry for easy access by sandbox ID
+	if err := r.addHostsEntry(spec.SandboxID, vmIP); err != nil {
+		log.Printf("[firecracker-runtime] Warning: failed to add hosts entry: %v", err)
+		// Continue - not critical
+	}
+
+	// Track the sandbox
+	now := time.Now()
+	r.mu.Lock()
+	r.sandboxes[spec.SandboxID] = &firecrackerSandbox{
+		spec:       spec,
+		state:      "running",
+		socketPath: socketPath,
+		rootfsPath: vmRootfs,
+		startedAt:  now,
+		expiresAt:  now.Add(spec.Timeout),
+		envdPort:   49983,
+		pid:        cmd.Process.Pid,
+		tapDevice:  tapDevice,
+		vmIP:       vmIP,
+		hostPort:   hostPort,
+	}
+	r.mu.Unlock()
+
+	log.Printf("[firecracker-runtime] Sandbox %s started (PID: %d, IP: %s, hostname: %s)",
+		spec.SandboxID, cmd.Process.Pid, vmIP, spec.SandboxID)
+	return nil
+}
+
+// createTapDevice creates a TAP network device for the VM
+func (r *FirecrackerRuntime) createTapDevice(ctx context.Context, tapName, hostIP, vmIP string, subnet byte) error {
+	// Create TAP device
+	if err := exec.CommandContext(ctx, "ip", "tuntap", "add", "dev", tapName, "mode", "tap").Run(); err != nil {
+		return fmt.Errorf("failed to create tap: %w", err)
+	}
+
+	// Bring up the TAP device
+	if err := exec.CommandContext(ctx, "ip", "link", "set", tapName, "up").Run(); err != nil {
+		exec.CommandContext(ctx, "ip", "link", "delete", tapName).Run()
+		return fmt.Errorf("failed to bring up tap: %w", err)
+	}
+
+	// Add unique IP address to TAP (host side of the link)
+	// Each TAP gets its own /24 subnet to avoid routing conflicts
+	if err := exec.CommandContext(ctx, "ip", "addr", "add", hostIP+"/24", "dev", tapName).Run(); err != nil {
+		// IP might already be assigned, try to continue
+		log.Printf("[firecracker-runtime] Note: IP addr add returned: %v (may be OK if already exists)", err)
+	}
+
+	// Enable IP forwarding
+	exec.CommandContext(ctx, "sysctl", "-w", "net.ipv4.ip_forward=1").Run()
+
+	// Add specific route to VM IP via this TAP device
+	// This ensures traffic to this VM goes through the correct TAP
+	exec.CommandContext(ctx, "ip", "route", "add", vmIP+"/32", "dev", tapName).Run()
+
+	log.Printf("[firecracker-runtime] Created TAP %s: host=%s, vm=%s (subnet %d)", tapName, hostIP, vmIP, subnet)
+	return nil
+}
+
+// addHostsEntry adds an entry to /etc/hosts for the sandbox
+func (r *FirecrackerRuntime) addHostsEntry(sandboxID, vmIP string) error {
+	entry := fmt.Sprintf("%s\t%s\n", vmIP, sandboxID)
+	
+	f, err := os.OpenFile("/etc/hosts", os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open /etc/hosts: %w", err)
+	}
+	defer f.Close()
+	
+	if _, err := f.WriteString(entry); err != nil {
+		return fmt.Errorf("failed to write to /etc/hosts: %w", err)
+	}
+	
+	log.Printf("[firecracker-runtime] Added /etc/hosts entry: %s -> %s", sandboxID, vmIP)
+	return nil
+}
+
+// removeHostsEntry removes the sandbox entry from /etc/hosts
+func (r *FirecrackerRuntime) removeHostsEntry(sandboxID string) error {
+	data, err := os.ReadFile("/etc/hosts")
+	if err != nil {
+		return fmt.Errorf("failed to read /etc/hosts: %w", err)
+	}
+	
+	lines := bytes.Split(data, []byte("\n"))
+	var newLines [][]byte
+	
+	for _, line := range lines {
+		// Skip lines containing the sandbox ID
+		if !bytes.Contains(line, []byte(sandboxID)) {
+			newLines = append(newLines, line)
+		}
+	}
+	
+	newData := bytes.Join(newLines, []byte("\n"))
+	if err := os.WriteFile("/etc/hosts", newData, 0644); err != nil {
+		return fmt.Errorf("failed to write /etc/hosts: %w", err)
+	}
+	
+	log.Printf("[firecracker-runtime] Removed /etc/hosts entry for %s", sandboxID)
+	return nil
+}
+
+// cleanupTapDevice removes the TAP device
+func (r *FirecrackerRuntime) cleanupTapDevice(ctx context.Context, tapName string) {
+	exec.CommandContext(ctx, "ip", "link", "delete", tapName).Run()
+}
+
+// setupPortForwarding sets up iptables NAT rules to forward host port to VM
+func (r *FirecrackerRuntime) setupPortForwarding(ctx context.Context, hostPort int32, vmIP string, vmPort int32) error {
+	dest := fmt.Sprintf("%s:%d", vmIP, vmPort)
+	portStr := fmt.Sprintf("%d", hostPort)
+
+	// DNAT rule for external traffic (PREROUTING)
+	if err := exec.CommandContext(ctx, "iptables", "-t", "nat", "-A", "PREROUTING",
+		"-p", "tcp", "--dport", portStr,
+		"-j", "DNAT", "--to-destination", dest).Run(); err != nil {
+		return fmt.Errorf("failed to add PREROUTING DNAT rule: %w", err)
+	}
+
+	// DNAT rule for local traffic (OUTPUT) - for when proxy runs on same host
+	exec.CommandContext(ctx, "iptables", "-t", "nat", "-A", "OUTPUT",
+		"-p", "tcp", "--dport", portStr,
+		"-j", "DNAT", "--to-destination", dest).Run()
+
+	// Allow forwarding to the VM
+	exec.CommandContext(ctx, "iptables", "-A", "FORWARD",
+		"-p", "tcp", "-d", vmIP, "--dport", fmt.Sprintf("%d", vmPort),
+		"-j", "ACCEPT").Run()
+
+	// Allow return traffic from VM
+	exec.CommandContext(ctx, "iptables", "-A", "FORWARD",
+		"-p", "tcp", "-s", vmIP, "--sport", fmt.Sprintf("%d", vmPort),
+		"-j", "ACCEPT").Run()
+
+	// MASQUERADE for return packets
+	exec.CommandContext(ctx, "iptables", "-t", "nat", "-A", "POSTROUTING",
+		"-p", "tcp", "-d", vmIP, "--dport", fmt.Sprintf("%d", vmPort),
+		"-j", "MASQUERADE").Run()
+
+	log.Printf("[firecracker-runtime] Set up port forwarding: host:%d -> %s", hostPort, dest)
+	return nil
+}
+
+// cleanupPortForwarding removes the iptables NAT rules
+func (r *FirecrackerRuntime) cleanupPortForwarding(ctx context.Context, hostPort int32, vmIP string, vmPort int32) {
+	dest := fmt.Sprintf("%s:%d", vmIP, vmPort)
+	portStr := fmt.Sprintf("%d", hostPort)
+	vmPortStr := fmt.Sprintf("%d", vmPort)
+
+	// Remove PREROUTING DNAT
+	exec.CommandContext(ctx, "iptables", "-t", "nat", "-D", "PREROUTING",
+		"-p", "tcp", "--dport", portStr,
+		"-j", "DNAT", "--to-destination", dest).Run()
+
+	// Remove OUTPUT DNAT
+	exec.CommandContext(ctx, "iptables", "-t", "nat", "-D", "OUTPUT",
+		"-p", "tcp", "--dport", portStr,
+		"-j", "DNAT", "--to-destination", dest).Run()
+
+	// Remove FORWARD rules
+	exec.CommandContext(ctx, "iptables", "-D", "FORWARD",
+		"-p", "tcp", "-d", vmIP, "--dport", vmPortStr,
+		"-j", "ACCEPT").Run()
+	exec.CommandContext(ctx, "iptables", "-D", "FORWARD",
+		"-p", "tcp", "-s", vmIP, "--sport", vmPortStr,
+		"-j", "ACCEPT").Run()
+
+	// Remove MASQUERADE
+	exec.CommandContext(ctx, "iptables", "-t", "nat", "-D", "POSTROUTING",
+		"-p", "tcp", "-d", vmIP, "--dport", vmPortStr,
+		"-j", "MASQUERADE").Run()
+
+	log.Printf("[firecracker-runtime] Cleaned up port forwarding for host:%d", hostPort)
+}
+
+// prepareRootfs prepares the rootfs for the VM, including injecting envd
+func (r *FirecrackerRuntime) prepareRootfs(ctx context.Context, spec *SandboxSpec, vmRootfs string, vmIP string, gateway string) error {
+	// Try to find existing rootfs in order of preference:
+	// 1. Template-specific ext4 rootfs (pre-built by build service)
+	// 2. Template-specific tar rootfs (needs conversion)
+	// 3. Base template rootfs (fallback)
+	// 4. Download/create minimal rootfs
+
+	rootfsFound := false
+
+	// 1. Check for template-specific ext4 rootfs
+	rootfsPath := filepath.Join(r.artifactsDir, spec.TemplateID, spec.BuildID, "rootfs.ext4")
+	if _, err := os.Stat(rootfsPath); err == nil {
+		log.Printf("[firecracker-runtime] Using template rootfs: %s", rootfsPath)
+		cpCmd := exec.CommandContext(ctx, "cp", "--reflink=auto", rootfsPath, vmRootfs)
+		if out, err := cpCmd.CombinedOutput(); err != nil {
+			log.Printf("[firecracker-runtime] Failed to copy template rootfs: %s: %v", string(out), err)
+		} else {
+			rootfsFound = true
+		}
+	}
+
+	// 2. Check for template-specific tar rootfs (needs conversion)
+	if !rootfsFound {
+		tarPath := filepath.Join(r.artifactsDir, spec.TemplateID, spec.BuildID, "rootfs.tar")
+		if _, err := os.Stat(tarPath); err == nil {
+			log.Printf("[firecracker-runtime] Converting tar rootfs: %s", tarPath)
+			if err := r.convertTarToExt4(ctx, tarPath, vmRootfs, int(spec.DiskSizeMB)); err != nil {
+				log.Printf("[firecracker-runtime] Failed to convert tar rootfs: %v", err)
+			} else {
+				rootfsFound = true
+			}
+		}
+	}
+
+	// 3. Check for base template rootfs (fallback for all templates)
+	if !rootfsFound {
+		baseRootfsPaths := []string{
+			filepath.Join(r.artifactsDir, "base", "default", "rootfs.ext4"),
+			filepath.Join(r.artifactsDir, "base", "rootfs.ext4"),
+			"/opt/e2b/base-rootfs.ext4",
+		}
+		for _, basePath := range baseRootfsPaths {
+			if _, err := os.Stat(basePath); err == nil {
+				log.Printf("[firecracker-runtime] Using base rootfs: %s", basePath)
+				cpCmd := exec.CommandContext(ctx, "cp", "--reflink=auto", basePath, vmRootfs)
+				if out, err := cpCmd.CombinedOutput(); err != nil {
+					log.Printf("[firecracker-runtime] Failed to copy base rootfs: %s: %v", string(out), err)
+				} else {
+					rootfsFound = true
+					break
+				}
+			}
+		}
+	}
+
+	// 4. Download or create minimal rootfs
+	if !rootfsFound {
+		log.Printf("[firecracker-runtime] No pre-built rootfs found, downloading base image...")
+		if err := r.downloadBaseRootfs(ctx, vmRootfs); err != nil {
+			log.Printf("[firecracker-runtime] Failed to download base rootfs: %v, creating minimal...", err)
+			if err := r.createMinimalRootfs(ctx, vmRootfs, int(spec.DiskSizeMB)); err != nil {
+				return fmt.Errorf("failed to create minimal rootfs: %w", err)
+			}
+		}
+	}
+
+	// Always inject envd into the rootfs for proper communication
+	if r.envdBinaryPath != "" {
+		if err := r.injectEnvdIntoRootfs(ctx, vmRootfs, spec, vmIP, gateway); err != nil {
+			log.Printf("[firecracker-runtime] Warning: failed to inject envd: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// downloadBaseRootfs downloads a pre-built base rootfs for Firecracker
+func (r *FirecrackerRuntime) downloadBaseRootfs(ctx context.Context, destPath string) error {
+	// Determine architecture
+	arch := "x86_64"
+	if out, err := exec.CommandContext(ctx, "uname", "-m").Output(); err == nil {
+		archStr := string(out)
+		if contains(archStr, "aarch64") || contains(archStr, "arm64") {
+			arch = "aarch64"
+		}
+	}
+
+	// Download official Firecracker quickstart rootfs
+	var url string
+	if arch == "aarch64" {
+		url = "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/aarch64/rootfs/bionic.rootfs.ext4"
+	} else {
+		url = "https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/rootfs/bionic.rootfs.ext4"
+	}
+
+	log.Printf("[firecracker-runtime] Downloading base rootfs from %s", url)
+
+	// Download to temp file first
+	tempPath := destPath + ".download"
+	curlCmd := exec.CommandContext(ctx, "curl", "-fsSL", "-o", tempPath, url)
+	if out, err := curlCmd.CombinedOutput(); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("curl failed: %s: %w", string(out), err)
+	}
+
+	// Move to final destination
+	if err := os.Rename(tempPath, destPath); err != nil {
+		os.Remove(tempPath)
+		return fmt.Errorf("failed to rename: %w", err)
+	}
+
+	// Also save as base rootfs for future use
+	baseDir := filepath.Join(r.artifactsDir, "base", "default")
+	os.MkdirAll(baseDir, 0755)
+	baseRootfs := filepath.Join(baseDir, "rootfs.ext4")
+	if _, err := os.Stat(baseRootfs); os.IsNotExist(err) {
+		exec.CommandContext(ctx, "cp", "--reflink=auto", destPath, baseRootfs).Run()
+		log.Printf("[firecracker-runtime] Saved base rootfs to %s", baseRootfs)
+	}
+
+	return nil
+}
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// createMinimalRootfs creates a minimal rootfs from debootstrap or alpine
+func (r *FirecrackerRuntime) createMinimalRootfs(ctx context.Context, rootfsPath string, sizeMB int) error {
+	if sizeMB <= 0 {
+		sizeMB = 2048
+	}
+
+	// Create sparse file
+	ddCmd := exec.CommandContext(ctx, "dd", "if=/dev/zero", "of="+rootfsPath, "bs=1M", "count=0", fmt.Sprintf("seek=%d", sizeMB))
+	if out, err := ddCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("dd failed: %s: %w", string(out), err)
+	}
+
+	// Format as ext4
+	mkfsCmd := exec.CommandContext(ctx, "mkfs.ext4", "-F", rootfsPath)
+	if out, err := mkfsCmd.CombinedOutput(); err != nil {
+		os.Remove(rootfsPath)
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(out), err)
+	}
+
+	// Mount, bootstrap, and unmount
+	mountPoint := rootfsPath + ".mount"
+	os.MkdirAll(mountPoint, 0755)
+	defer os.RemoveAll(mountPoint)
+
+	mountCmd := exec.CommandContext(ctx, "mount", "-o", "loop", rootfsPath, mountPoint)
+	if out, err := mountCmd.CombinedOutput(); err != nil {
+		os.Remove(rootfsPath)
+		return fmt.Errorf("mount failed: %s: %w", string(out), err)
+	}
+	defer exec.CommandContext(ctx, "umount", mountPoint).Run()
+
+	// Try debootstrap for a minimal Debian/Ubuntu system
+	debCmd := exec.CommandContext(ctx, "debootstrap", "--variant=minbase", "jammy", mountPoint, "http://archive.ubuntu.com/ubuntu")
+	if out, err := debCmd.CombinedOutput(); err != nil {
+		log.Printf("[firecracker-runtime] debootstrap failed: %s, trying alpine", string(out))
+
+		// Fallback: create minimal structure manually
+		dirs := []string{"bin", "etc", "home/user", "lib", "lib64", "proc", "root", "run", "sbin", "sys", "tmp", "usr/bin", "usr/sbin", "var/log"}
+		for _, d := range dirs {
+			os.MkdirAll(filepath.Join(mountPoint, d), 0755)
+		}
+
+		// Create minimal init script
+		initScript := `#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+hostname sandbox
+
+# Configure network
+ip link set lo up
+ip link set eth0 up
+ip addr add 192.168.100.2/24 dev eth0
+ip route add default via 192.168.100.1
+
+# Start envd if available
+if [ -x /usr/local/bin/envd ]; then
+    /usr/local/bin/envd &
+fi
+
+# Keep running
+exec /bin/sh
+`
+		if err := os.WriteFile(filepath.Join(mountPoint, "init"), []byte(initScript), 0755); err != nil {
+			return fmt.Errorf("failed to write init: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// injectEnvdIntoRootfs mounts the rootfs and copies envd into it
+func (r *FirecrackerRuntime) injectEnvdIntoRootfs(ctx context.Context, rootfsPath string, spec *SandboxSpec, vmIP string, gateway string) error {
+	mountPoint := rootfsPath + ".mount"
+	os.MkdirAll(mountPoint, 0755)
+	defer os.RemoveAll(mountPoint)
+
+	// Mount rootfs
+	mountCmd := exec.CommandContext(ctx, "mount", "-o", "loop", rootfsPath, mountPoint)
+	if out, err := mountCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mount failed: %s: %w", string(out), err)
+	}
+	defer exec.CommandContext(ctx, "umount", mountPoint).Run()
+
+	// Copy envd binary
+	envdDst := filepath.Join(mountPoint, "usr", "local", "bin", "envd")
+	os.MkdirAll(filepath.Dir(envdDst), 0755)
+
+	cpCmd := exec.CommandContext(ctx, "cp", r.envdBinaryPath, envdDst)
+	if out, err := cpCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to copy envd: %s: %w", string(out), err)
+	}
+
+	// Make executable
+	os.Chmod(envdDst, 0755)
+
+	// Create systemd service for envd - runs early in boot
+	envdService := fmt.Sprintf(`[Unit]
+Description=E2B Environment Daemon
+After=network-pre.target systemd-sysctl.service
+Before=network.target
+Wants=network-pre.target
+
+[Service]
+Type=simple
+Environment=E2B_ACCESS_TOKEN=%s
+Environment=E2B_ENVD_PORT=49983
+ExecStartPre=/bin/sh -c 'ip link set lo up; ip link set eth0 up 2>/dev/null || true; ip addr add %s/24 dev eth0 2>/dev/null || true; ip route add default via %s 2>/dev/null || true'
+ExecStart=/usr/local/bin/envd
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+`, spec.EnvdToken, vmIP, gateway)
+
+	systemdDir := filepath.Join(mountPoint, "etc", "systemd", "system")
+	os.MkdirAll(systemdDir, 0755)
+	servicePath := filepath.Join(systemdDir, "envd.service")
+	if err := os.WriteFile(servicePath, []byte(envdService), 0644); err != nil {
+		log.Printf("[firecracker-runtime] Warning: could not write systemd service: %v", err)
+	}
+
+	// Enable the service using RELATIVE symlink paths (critical for rootfs)
+	wantsDir := filepath.Join(systemdDir, "multi-user.target.wants")
+	os.MkdirAll(wantsDir, 0755)
+	symlinkPath := filepath.Join(wantsDir, "envd.service")
+	os.Remove(symlinkPath)
+	os.Symlink("../envd.service", symlinkPath) // Relative path!
+
+	// Also enable in basic.target.wants for early startup
+	basicWantsDir := filepath.Join(systemdDir, "basic.target.wants")
+	os.MkdirAll(basicWantsDir, 0755)
+	os.Remove(filepath.Join(basicWantsDir, "envd.service"))
+	os.Symlink("../envd.service", filepath.Join(basicWantsDir, "envd.service"))
+
+	// Create a keep-alive service that prevents the VM from shutting down
+	keepAliveService := `[Unit]
+Description=E2B Keep Alive Service
+After=envd.service
+Requires=envd.service
+
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'while true; do sleep 3600; done'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+`
+	keepAlivePath := filepath.Join(systemdDir, "e2b-keepalive.service")
+	os.WriteFile(keepAlivePath, []byte(keepAliveService), 0644)
+	os.Remove(filepath.Join(wantsDir, "e2b-keepalive.service"))
+	os.Symlink("../e2b-keepalive.service", filepath.Join(wantsDir, "e2b-keepalive.service"))
+
+	// Override getty@tty1 to auto-login as root and run envd
+	gettyOverrideDir := filepath.Join(systemdDir, "getty@tty1.service.d")
+	os.MkdirAll(gettyOverrideDir, 0755)
+	gettyOverride := `[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+`
+	os.WriteFile(filepath.Join(gettyOverrideDir, "override.conf"), []byte(gettyOverride), 0644)
+
+	// Override serial-getty@ttyS0 for serial console auto-login
+	serialGettyOverrideDir := filepath.Join(systemdDir, "serial-getty@ttyS0.service.d")
+	os.MkdirAll(serialGettyOverrideDir, 0755)
+	serialGettyOverride := `[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin root --keep-baud 115200,38400,9600 %I $TERM
+`
+	os.WriteFile(filepath.Join(serialGettyOverrideDir, "override.conf"), []byte(serialGettyOverride), 0644)
+
+	// Also write a simple init.d script as fallback
+	initScript := fmt.Sprintf(`#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          envd
+# Required-Start:    $network $local_fs
+# Required-Stop:     $network $local_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Description:       E2B Environment Daemon
+### END INIT INFO
+
+export E2B_ACCESS_TOKEN=%s
+export E2B_ENVD_PORT=49983
+
+case "$1" in
+    start)
+        ip link set eth0 up 2>/dev/null || true
+        ip addr add %s/24 dev eth0 2>/dev/null || true
+        ip route add default via %s 2>/dev/null || true
+        /usr/local/bin/envd > /var/log/envd.log 2>&1 &
+        ;;
+    stop)
+        pkill envd || true
+        ;;
+    *)
+        echo "Usage: $0 {start|stop}"
+        exit 1
+        ;;
+esac
+exit 0
+`, spec.EnvdToken, vmIP, gateway)
+
+	initPath := filepath.Join(mountPoint, "etc", "init.d", "envd")
+	os.MkdirAll(filepath.Dir(initPath), 0755)
+	os.WriteFile(initPath, []byte(initScript), 0755)
+
+	// Create symlinks for SysV init runlevels
+	for _, runlevel := range []string{"2", "3", "4", "5"} {
+		rcDir := filepath.Join(mountPoint, "etc", "rc"+runlevel+".d")
+		os.MkdirAll(rcDir, 0755)
+		os.Remove(filepath.Join(rcDir, "S99envd"))
+		os.Symlink("../init.d/envd", filepath.Join(rcDir, "S99envd"))
+	}
+
+	// Add to rc.local for systems that use it - includes network setup
+	rcLocalPath := filepath.Join(mountPoint, "etc", "rc.local")
+	rcLocal := fmt.Sprintf(`#!/bin/sh -e
+# E2B Sandbox Initialization - rc.local
+
+# Configure network
+ip link set lo up 2>/dev/null || true
+ip link set eth0 up 2>/dev/null || true
+
+# Static IP configuration
+ip addr show eth0 2>/dev/null | grep -q "%s" || {
+    ip addr add %s/24 dev eth0 2>/dev/null || true
+    ip route add default via %s 2>/dev/null || true
+}
+
+# Start envd daemon if not already running
+if ! pgrep -x envd > /dev/null 2>&1; then
+    export E2B_ACCESS_TOKEN=%s
+    export E2B_ENVD_PORT=49983
+    /usr/local/bin/envd > /var/log/envd.log 2>&1 &
+    echo "envd started on port 49983"
+fi
+
+exit 0
+`, vmIP, vmIP, gateway, spec.EnvdToken)
+	os.WriteFile(rcLocalPath, []byte(rcLocal), 0755)
+
+	// Enable rc.local service for systemd
+	rcLocalService := `[Unit]
+Description=/etc/rc.local Compatibility
+ConditionFileIsExecutable=/etc/rc.local
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=/etc/rc.local start
+TimeoutSec=0
+RemainAfterExit=yes
+GuessMainPID=no
+
+[Install]
+WantedBy=multi-user.target
+`
+	rcLocalServicePath := filepath.Join(systemdDir, "rc-local.service")
+	os.WriteFile(rcLocalServicePath, []byte(rcLocalService), 0644)
+	os.Remove(filepath.Join(wantsDir, "rc-local.service"))
+	os.Symlink("../rc-local.service", filepath.Join(wantsDir, "rc-local.service"))
+
+	// Also update /etc/network/interfaces for Debian/Ubuntu systems
+	interfacesPath := filepath.Join(mountPoint, "etc", "network", "interfaces")
+	os.MkdirAll(filepath.Dir(interfacesPath), 0755)
+	interfacesConfig := fmt.Sprintf(`# E2B Network Configuration
+auto lo
+iface lo inet loopback
+
+auto eth0
+iface eth0 inet static
+    address %s
+    netmask 255.255.255.0
+    gateway %s
+`, vmIP, gateway)
+	os.WriteFile(interfacesPath, []byte(interfacesConfig), 0644)
+
+	// Add to root's .profile as ultimate fallback (runs on auto-login)
+	profilePath := filepath.Join(mountPoint, "root", ".profile")
+	os.MkdirAll(filepath.Dir(profilePath), 0755)
+	profileScript := fmt.Sprintf(`# E2B Sandbox Startup
+
+# Configure network if not already done
+ip link set eth0 up 2>/dev/null
+ip addr show eth0 | grep -q "%s" || {
+    ip addr add %s/24 dev eth0 2>/dev/null
+    ip route add default via %s 2>/dev/null
+}
+
+# Start envd if not already running
+if ! pgrep -x envd > /dev/null 2>&1; then
+    export E2B_ACCESS_TOKEN=%s
+    export E2B_ENVD_PORT=49983
+    nohup /usr/local/bin/envd > /var/log/envd.log 2>&1 &
+    echo "envd started"
+fi
+`, vmIP, vmIP, gateway, spec.EnvdToken)
+	os.WriteFile(profilePath, []byte(profileScript), 0644)
+
+	// Also add to .bashrc for interactive shells
+	bashrcPath := filepath.Join(mountPoint, "root", ".bashrc")
+	// Read existing bashrc if it exists, and append our script
+	existingBashrc := ""
+	if data, err := os.ReadFile(bashrcPath); err == nil {
+		existingBashrc = string(data) + "\n"
+	}
+	os.WriteFile(bashrcPath, []byte(existingBashrc+profileScript), 0644)
+
+	log.Printf("[firecracker-runtime] Injected envd and network config into rootfs")
+	return nil
+}
+
+func (r *FirecrackerRuntime) convertTarToExt4(ctx context.Context, tarPath, ext4Path string, sizeMB int) error {
+	if sizeMB <= 0 {
+		sizeMB = 2048 // Default 2GB
+	}
+
+	// Create sparse file
+	ddCmd := exec.CommandContext(ctx, "dd", "if=/dev/zero", "of="+ext4Path, "bs=1M", "count=0", fmt.Sprintf("seek=%d", sizeMB))
+	if out, err := ddCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("dd failed: %s: %w", string(out), err)
+	}
+
+	// Format as ext4
+	mkfsCmd := exec.CommandContext(ctx, "mkfs.ext4", "-F", ext4Path)
+	if out, err := mkfsCmd.CombinedOutput(); err != nil {
+		os.Remove(ext4Path)
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(out), err)
+	}
+
+	// Mount and extract
+	mountPoint := ext4Path + ".mount"
+	os.MkdirAll(mountPoint, 0755)
+	defer os.RemoveAll(mountPoint)
+
+	mountCmd := exec.CommandContext(ctx, "mount", "-o", "loop", ext4Path, mountPoint)
+	if out, err := mountCmd.CombinedOutput(); err != nil {
+		os.Remove(ext4Path)
+		return fmt.Errorf("mount failed: %s: %w", string(out), err)
+	}
+	defer exec.CommandContext(ctx, "umount", mountPoint).Run()
+
+	// Extract tar
+	tarCmd := exec.CommandContext(ctx, "tar", "-xf", tarPath, "-C", mountPoint)
+	if out, err := tarCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tar extract failed: %s: %w", string(out), err)
+	}
+
+	return nil
+}
+
+func (r *FirecrackerRuntime) generateConfig(spec *SandboxSpec, rootfsPath, tapDevice, macAddr string) string {
+	cpuCount := spec.CPUCount
+	if cpuCount <= 0 {
+		cpuCount = 1
+	}
+	memoryMB := spec.MemoryMB
+	if memoryMB <= 0 {
+		memoryMB = 512
+	}
+
+	// Generate Firecracker JSON config
+	return fmt.Sprintf(`{
+  "boot-source": {
+    "kernel_image_path": "%s",
+    "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/init quiet"
+  },
+  "drives": [
+    {
+      "drive_id": "rootfs",
+      "path_on_host": "%s",
+      "is_root_device": true,
+      "is_read_only": false
+    }
+  ],
+  "machine-config": {
+    "vcpu_count": %d,
+    "mem_size_mib": %d
+  },
+  "network-interfaces": [
+    {
+      "iface_id": "eth0",
+      "guest_mac": "%s",
+      "host_dev_name": "%s"
+    }
+  ]
+}`, r.kernelPath, rootfsPath, cpuCount, memoryMB, macAddr, tapDevice)
+}
+
+// waitForEnvd waits for envd to respond on the given address
+func (r *FirecrackerRuntime) waitForEnvd(ctx context.Context, vmIP string, port int32, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	addr := fmt.Sprintf("%s:%d", vmIP, port)
+
+	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+		if err == nil {
+			conn.Close()
+			log.Printf("[firecracker-runtime] envd responding at %s", addr)
+			return nil
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+	return fmt.Errorf("envd not responding at %s after %v", addr, timeout)
+}
+
+func (r *FirecrackerRuntime) StopSandbox(ctx context.Context, sandboxID string, force bool) error {
+	r.mu.Lock()
+	sb, exists := r.sandboxes[sandboxID]
+	if exists {
+		delete(r.sandboxes, sandboxID)
+	}
+	r.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("sandbox not found: %s", sandboxID)
+	}
+
+	// Kill the Firecracker process
+	if sb.pid > 0 {
+		if force {
+			exec.CommandContext(ctx, "kill", "-9", fmt.Sprintf("%d", sb.pid)).Run()
+		} else {
+			exec.CommandContext(ctx, "kill", fmt.Sprintf("%d", sb.pid)).Run()
+		}
+	}
+
+	// Clean up TAP device
+	r.cleanupTapDevice(ctx, sb.tapDevice)
+
+	// Release subnet
+	r.releaseSubnet(sandboxID)
+
+	// Remove /etc/hosts entry
+	if err := r.removeHostsEntry(sandboxID); err != nil {
+		log.Printf("[firecracker-runtime] Warning: failed to remove hosts entry: %v", err)
+	}
+
+	// Clean up sandbox directory
+	sandboxDir := filepath.Join(r.sandboxesDir, sandboxID)
+	os.RemoveAll(sandboxDir)
+
+	log.Printf("[firecracker-runtime] Sandbox %s stopped", sandboxID)
+	return nil
+}
+
+func (r *FirecrackerRuntime) PauseSandbox(ctx context.Context, sandboxID string) (string, error) {
+	r.mu.RLock()
+	sb, exists := r.sandboxes[sandboxID]
+	r.mu.RUnlock()
+
+	if !exists {
+		return "", fmt.Errorf("sandbox not found: %s", sandboxID)
+	}
+
+	snapshotID := fmt.Sprintf("%s-snapshot-%d", sandboxID, time.Now().Unix())
+	snapshotDir := filepath.Join(r.sandboxesDir, sandboxID, "snapshots", snapshotID)
+	os.MkdirAll(snapshotDir, 0755)
+
+	// Send pause request to Firecracker API
+	pauseReq := map[string]string{"state": "Paused"}
+	pauseBody, _ := json.Marshal(pauseReq)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("unix", sb.socketPath)
+			},
+		},
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, "PATCH", "http://localhost/vm", bytes.NewReader(pauseBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to pause VM: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("pause failed: %s", string(body))
+	}
+
+	// Create snapshot
+	snapshotReq := map[string]interface{}{
+		"snapshot_type": "Full",
+		"snapshot_path": filepath.Join(snapshotDir, "vmstate"),
+		"mem_file_path": filepath.Join(snapshotDir, "mem"),
+	}
+	snapshotBody, _ := json.Marshal(snapshotReq)
+
+	req, _ = http.NewRequestWithContext(ctx, "PUT", "http://localhost/snapshot/create", bytes.NewReader(snapshotBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to create snapshot: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("snapshot failed: %s", string(body))
+	}
+
+	r.mu.Lock()
+	sb.state = "paused"
+	r.mu.Unlock()
+
+	log.Printf("[firecracker-runtime] Sandbox %s paused, snapshot: %s", sandboxID, snapshotID)
+	return snapshotID, nil
+}
+
+func (r *FirecrackerRuntime) ResumeSandbox(ctx context.Context, sandboxID, snapshotID string) error {
+	r.mu.Lock()
+	sb, exists := r.sandboxes[sandboxID]
+	if exists {
+		sb.state = "running"
+	}
+	r.mu.Unlock()
+
+	if !exists {
+		return fmt.Errorf("sandbox not found: %s", sandboxID)
+	}
+
+	// Send resume request to Firecracker API
+	resumeReq := map[string]string{"state": "Resumed"}
+	resumeBody, _ := json.Marshal(resumeReq)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return net.Dial("unix", sb.socketPath)
+			},
+		},
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, "PATCH", "http://localhost/vm", bytes.NewReader(resumeBody))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to resume VM: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("resume failed: %s", string(body))
+	}
+
+	log.Printf("[firecracker-runtime] Sandbox %s resumed", sandboxID)
+	return nil
+}
+
+func (r *FirecrackerRuntime) GetSandboxStatus(ctx context.Context, sandboxID string) (*SandboxInfo, error) {
+	r.mu.RLock()
+	sb, exists := r.sandboxes[sandboxID]
+	r.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("sandbox not found: %s", sandboxID)
+	}
+
+	return &SandboxInfo{
+		SandboxID:   sandboxID,
+		TemplateID:  sb.spec.TemplateID,
+		BuildID:     sb.spec.BuildID,
+		State:       sb.state,
+		EnvdAddress: fmt.Sprintf("%s:%d", sb.vmIP, sb.envdPort),
+		EnvdPort:    sb.hostPort, // Return host port for external access
+		StartedAt:   sb.startedAt.Unix(),
+		ExpiresAt:   sb.expiresAt.Unix(),
+		CPUCount:    sb.spec.CPUCount,
+		MemoryMB:    sb.spec.MemoryMB,
+	}, nil
+}
+
+func (r *FirecrackerRuntime) ListSandboxes(ctx context.Context) ([]*SandboxInfo, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var sandboxes []*SandboxInfo
+	for id, sb := range r.sandboxes {
+		sandboxes = append(sandboxes, &SandboxInfo{
+			SandboxID:   id,
+			TemplateID:  sb.spec.TemplateID,
+			BuildID:     sb.spec.BuildID,
+			State:       sb.state,
+			EnvdAddress: fmt.Sprintf("%s:%d", sb.vmIP, sb.envdPort),
+			EnvdPort:    sb.hostPort,
+			StartedAt:   sb.startedAt.Unix(),
+			ExpiresAt:   sb.expiresAt.Unix(),
+			CPUCount:    sb.spec.CPUCount,
+			MemoryMB:    sb.spec.MemoryMB,
+		})
+	}
+
+	return sandboxes, nil
+}
+
+func (r *FirecrackerRuntime) ExecCommand(ctx context.Context, sandboxID, command string, args []string) (<-chan ExecOutput, error) {
+	r.mu.RLock()
+	sb, exists := r.sandboxes[sandboxID]
+	r.mu.RUnlock()
+
+	if !exists {
+		return nil, fmt.Errorf("sandbox not found: %s", sandboxID)
+	}
+
+	outputCh := make(chan ExecOutput, 10)
+
+	go func() {
+		defer close(outputCh)
+
+		// Connect to envd via the VM's IP
+		envdAddr := fmt.Sprintf("http://%s:%d", sb.vmIP, sb.envdPort)
+
+		// Build command request
+		cmdReq := map[string]interface{}{
+			"process": map[string]interface{}{
+				"cmd":  command,
+				"args": args,
+			},
+		}
+		reqBody, _ := json.Marshal(cmdReq)
+
+		// Make HTTP request to envd process.Process/Start
+		req, err := http.NewRequestWithContext(ctx, "POST", envdAddr+"/process.Process/Start", bytes.NewReader(reqBody))
+		if err != nil {
+			outputCh <- ExecOutput{Stderr: []byte(fmt.Sprintf("failed to create request: %v", err))}
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			outputCh <- ExecOutput{Stderr: []byte(fmt.Sprintf("failed to execute command: %v", err))}
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			outputCh <- ExecOutput{Stderr: []byte(fmt.Sprintf("envd returned %d: %s", resp.StatusCode, bytes.TrimSpace(body)))}
+			return
+		}
+
+		// Stream NDJSON response and forward stdout/stderr/exit_code
+		decoder := json.NewDecoder(resp.Body)
+
+		for {
+			var event struct {
+				Data *struct {
+					Stdout []byte `json:"stdout,omitempty"`
+					Stderr []byte `json:"stderr,omitempty"`
+				} `json:"data,omitempty"`
+				End *struct {
+					ExitCode int32   `json:"exit_code"`
+					Error    *string `json:"error,omitempty"`
+				} `json:"end,omitempty"`
+			}
+
+			if err := decoder.Decode(&event); err != nil {
+				if err == io.EOF {
+					return
+				}
+				outputCh <- ExecOutput{Stderr: []byte(fmt.Sprintf("failed to decode process output: %v", err))}
+				return
+			}
+
+			if event.Data != nil {
+				if len(event.Data.Stdout) > 0 {
+					outputCh <- ExecOutput{Stdout: event.Data.Stdout}
+				}
+				if len(event.Data.Stderr) > 0 {
+					outputCh <- ExecOutput{Stderr: event.Data.Stderr}
+				}
+			}
+
+			if event.End != nil {
+				if event.End.Error != nil {
+					outputCh <- ExecOutput{Stderr: []byte(*event.End.Error)}
+				}
+				exitCode := event.End.ExitCode
+				outputCh <- ExecOutput{ExitCode: &exitCode}
+				return
+			}
+		}
+	}()
+
+	return outputCh, nil
+}

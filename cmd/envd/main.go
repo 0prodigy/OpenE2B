@@ -6,9 +6,14 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/0prodigy/OpenE2B/pkg/envd/api"
-	"github.com/0prodigy/OpenE2B/pkg/envd/connect"
+	"github.com/0prodigy/OpenE2B/pkg/envd/rpc"
+	"github.com/0prodigy/OpenE2B/pkg/proto/filesystem/filesystemconnect"
+	"github.com/0prodigy/OpenE2B/pkg/proto/process/processconnect"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 func main() {
@@ -22,11 +27,11 @@ func main() {
 	// Create main mux for all routes
 	mux := http.NewServeMux()
 
-	// Create REST API handler and router
+	// Create REST API handler for file upload/download
 	restHandler := api.NewHandler(config)
 	restRouter := api.NewRouter(restHandler)
 
-	// Register REST routes
+	// Register REST routes (file upload/download, health, etc.)
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) { restRouter.ServeHTTP(w, r) })
 	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) { restRouter.ServeHTTP(w, r) })
 	mux.HandleFunc("POST /init", func(w http.ResponseWriter, r *http.Request) { restRouter.ServeHTTP(w, r) })
@@ -34,24 +39,51 @@ func main() {
 	mux.HandleFunc("GET /files", func(w http.ResponseWriter, r *http.Request) { restRouter.ServeHTTP(w, r) })
 	mux.HandleFunc("POST /files", func(w http.ResponseWriter, r *http.Request) { restRouter.ServeHTTP(w, r) })
 
-	// Create and register Connect-RPC handlers
-	fsHandler := connect.NewFilesystemHandler()
-	fsHandler.Register(mux)
+	// Create and register proper Connect-RPC handlers
+	// These implement the full Connect-RPC protocol that the SDK expects
 
-	procHandler := connect.NewProcessHandler()
-	procHandler.Register(mux)
+	// Process service (command execution)
+	procService := rpc.NewProcessService()
+	procPath, procHandler := processconnect.NewProcessHandler(procService)
+	mux.Handle(procPath, procHandler)
+	log.Printf("  Registered Connect-RPC: %s", procPath)
 
-	// Apply middleware chain
-	var h http.Handler = mux
-	h = api.AuthMiddleware(restHandler)(h)
-	h = api.CORSMiddleware(h)
-	h = loggingMiddleware(h)
+	// Filesystem service
+	fsService := rpc.NewFilesystemService(config.RootPath)
+	fsPath, fsHandler := filesystemconnect.NewFilesystemHandler(fsService)
+	mux.Handle(fsPath, fsHandler)
+	log.Printf("  Registered Connect-RPC: %s", fsPath)
+
+	// Apply middleware chain - but bypass for Connect-RPC paths to avoid interference with streaming
+	// Create a wrapper that skips middleware for RPC paths
+	var h http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip middleware for Connect-RPC paths (they use /package.Service/Method format)
+		if len(r.URL.Path) > 1 && r.URL.Path[0] == '/' {
+			// Check if it looks like a Connect-RPC path
+			parts := strings.Split(r.URL.Path[1:], "/")
+			if len(parts) >= 2 && strings.Contains(parts[0], ".") {
+				// This looks like a Connect-RPC path, skip middleware
+				log.Printf("[envd] Connect-RPC: %s %s", r.Method, r.URL.Path)
+				mux.ServeHTTP(w, r)
+				return
+			}
+		}
+
+		// Apply middleware for non-RPC paths
+		chain := api.AuthMiddleware(restHandler)(mux)
+		chain = api.CORSMiddleware(chain)
+		chain = loggingMiddleware(chain)
+		chain.ServeHTTP(w, r)
+	})
+
+	// Use h2c for HTTP/2 without TLS (required for Connect-RPC streaming)
+	h2cHandler := h2c.NewHandler(h, &http2.Server{})
 
 	// Start server
 	addr := fmt.Sprintf(":%d", config.Port)
 	log.Printf("Listening on %s", addr)
 
-	if err := http.ListenAndServe(addr, h); err != nil {
+	if err := http.ListenAndServe(addr, h2cHandler); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }

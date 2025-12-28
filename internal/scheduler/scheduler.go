@@ -1,4 +1,4 @@
-package orchestrator
+package scheduler
 
 import (
 	"context"
@@ -7,22 +7,118 @@ import (
 	"time"
 )
 
-// Scheduler manages sandbox placement and lifecycle
+// SandboxState represents the lifecycle state of a sandbox
+type SandboxState string
+
+const (
+	SandboxStatePending  SandboxState = "pending"
+	SandboxStateStarting SandboxState = "starting"
+	SandboxStateRunning  SandboxState = "running"
+	SandboxStatePaused   SandboxState = "paused"
+	SandboxStateStopping SandboxState = "stopping"
+	SandboxStateStopped  SandboxState = "stopped"
+	SandboxStateError    SandboxState = "error"
+)
+
+// SandboxSpec defines the desired state for a sandbox
+type SandboxSpec struct {
+	ID            string
+	TemplateID    string
+	BuildID       string
+	CPUCount      int
+	MemoryMB      int
+	DiskSizeMB    int
+	EnvVars       map[string]string
+	Metadata      map[string]string
+	Timeout       time.Duration
+	AutoPause     bool
+	EnvdToken     string
+	NetworkConfig *NetworkConfig
+}
+
+// NetworkConfig defines sandbox network settings
+type NetworkConfig struct {
+	AllowPublicTraffic bool
+	AllowOut           []string
+	DenyOut            []string
+	MaskRequestHost    string
+}
+
+// SandboxStatus represents the current observed state
+type SandboxStatus struct {
+	State       SandboxState
+	NodeID      string
+	HostPort    int
+	EnvdPort    int
+	StartedAt   time.Time
+	ExpiresAt   time.Time
+	ErrorReason string
+}
+
+// Sandbox combines spec and status
+type Sandbox struct {
+	Spec   SandboxSpec
+	Status SandboxStatus
+}
+
+// NodeState represents the health state of a node
+type NodeState string
+
+const (
+	NodeStateReady      NodeState = "ready"
+	NodeStateDraining   NodeState = "draining"
+	NodeStateConnecting NodeState = "connecting"
+	NodeStateUnhealthy  NodeState = "unhealthy"
+)
+
+// NodeSpec defines node configuration
+type NodeSpec struct {
+	ID          string
+	ClusterID   string
+	Address     string
+	CPUCount    int
+	MemoryBytes int64
+}
+
+// NodeStatus represents current node state
+type NodeStatus struct {
+	State           NodeState
+	AllocatedCPU    int
+	AllocatedMemory int64
+	SandboxCount    int
+	CachedBuilds    []string
+	LastHeartbeat   time.Time
+}
+
+// Node combines spec and status
+type Node struct {
+	Spec   NodeSpec
+	Status NodeStatus
+}
+
+// NodeOperations defines the interface for node management (implemented by Orchestrator clients)
+type NodeOperations interface {
+	CreateSandbox(ctx context.Context, node *Node, spec SandboxSpec) (*SandboxResult, error)
+	StopSandbox(ctx context.Context, node *Node, sandboxID string) error
+	PauseSandbox(ctx context.Context, node *Node, sandboxID string) error
+	ResumeSandbox(ctx context.Context, node *Node, sandboxID string) error
+	GetSandboxHost(sandboxID string) (host string, port int, ok bool)
+}
+
+// SandboxResult contains the result of creating a sandbox
+type SandboxResult struct {
+	HostPort int
+	EnvdPort int
+}
+
+// Scheduler manages sandbox placement and lifecycle in the control plane
 type Scheduler struct {
 	nodes     map[string]*Node
 	sandboxes map[string]*Sandbox
 	mu        sync.RWMutex
 
-	// Callbacks for node operations
+	// nodeOps is the interface for communicating with Orchestrator nodes
 	nodeOps NodeOperations
-}
-
-// NodeOperations defines the interface for node management
-type NodeOperations interface {
-	CreateSandbox(ctx context.Context, node *Node, spec SandboxSpec) error
-	StopSandbox(ctx context.Context, node *Node, sandboxID string) error
-	PauseSandbox(ctx context.Context, node *Node, sandboxID string) error
-	ResumeSandbox(ctx context.Context, node *Node, sandboxID string) error
 }
 
 // NewScheduler creates a new scheduler
@@ -71,12 +167,17 @@ func (s *Scheduler) Schedule(ctx context.Context, spec SandboxSpec) (*Sandbox, e
 		},
 	}
 
-	// Create on node
+	// Create on node via Orchestrator
 	if s.nodeOps != nil {
-		if err := s.nodeOps.CreateSandbox(ctx, node, spec); err != nil {
+		result, err := s.nodeOps.CreateSandbox(ctx, node, spec)
+		if err != nil {
 			sandbox.Status.State = SandboxStateError
 			sandbox.Status.ErrorReason = err.Error()
 			return nil, err
+		}
+		if result != nil {
+			sandbox.Status.HostPort = result.HostPort
+			sandbox.Status.EnvdPort = result.EnvdPort
 		}
 	}
 
@@ -239,6 +340,30 @@ func (s *Scheduler) GetSandbox(sandboxID string) (*Sandbox, bool) {
 	defer s.mu.RUnlock()
 	sb, ok := s.sandboxes[sandboxID]
 	return sb, ok
+}
+
+// GetSandboxHost returns the host and port for a sandbox (for proxy routing)
+func (s *Scheduler) GetSandboxHost(sandboxID string) (host string, port int, state SandboxState, ok bool) {
+	s.mu.RLock()
+	sandbox, exists := s.sandboxes[sandboxID]
+	s.mu.RUnlock()
+
+	if !exists {
+		return "", 0, "", false
+	}
+
+	// Get the host from the node
+	node, nodeExists := s.nodes[sandbox.Status.NodeID]
+	if !nodeExists {
+		return "", 0, sandbox.Status.State, false
+	}
+
+	host = node.Spec.Address
+	if host == "" {
+		host = "localhost" // Default for local development
+	}
+
+	return host, sandbox.Status.HostPort, sandbox.Status.State, true
 }
 
 // ListSandboxes returns all sandboxes

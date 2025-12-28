@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/0prodigy/OpenE2B/internal/db"
-	"github.com/0prodigy/OpenE2B/internal/orchestrator"
+	"github.com/0prodigy/OpenE2B/internal/scheduler"
 	"github.com/google/uuid"
 )
 
@@ -82,6 +82,11 @@ type Build struct {
 	mu         sync.Mutex
 }
 
+// ImageManager interface for image operations
+type ImageManager interface {
+	// Interface kept minimal for now
+}
+
 // Service manages template builds using the V2 SDK flow:
 // 1. SDK calls POST /v3/templates to create template+build record
 // 2. SDK uploads files to storage (GET /templates/{id}/files/{hash})
@@ -90,8 +95,8 @@ type Build struct {
 // 5. SDK polls GET /templates/{id}/builds/{buildID}/status
 type Service struct {
 	store        db.Store
-	scheduler    *orchestrator.Scheduler
-	imageManager *orchestrator.ImageManager
+	scheduler    *scheduler.Scheduler
+	imageManager ImageManager
 	domain       string
 	artifactsDir string
 	builds       map[string]*Build
@@ -102,7 +107,7 @@ type Service struct {
 }
 
 // NewService creates a new build service
-func NewService(store db.Store, scheduler *orchestrator.Scheduler, imageManager *orchestrator.ImageManager, domain string, artifactsDir string, workers int) *Service {
+func NewService(store db.Store, sched *scheduler.Scheduler, imageManager ImageManager, domain string, artifactsDir string, workers int) *Service {
 	if workers <= 0 {
 		workers = 2
 	}
@@ -112,7 +117,7 @@ func NewService(store db.Store, scheduler *orchestrator.Scheduler, imageManager 
 
 	s := &Service{
 		store:        store,
-		scheduler:    scheduler,
+		scheduler:    sched,
 		imageManager: imageManager,
 		domain:       domain,
 		artifactsDir: artifactsDir,
@@ -320,14 +325,14 @@ func (s *Service) processBuild(build *Build) {
 	if artifactsDir == "" {
 		artifactsDir = "data/artifacts"
 	}
-	
+
 	// Create template artifacts directory
 	templateArtifactsDir := filepath.Join(artifactsDir, build.TemplateID, build.ID)
 	if err := os.MkdirAll(templateArtifactsDir, 0755); err != nil {
 		s.addLog(build, LogLevelWarn, fmt.Sprintf("Failed to create artifacts directory: %v", err), nil)
 	} else {
 		s.addLog(build, LogLevelInfo, "Exporting rootfs artifact...", nil)
-		
+
 		// Export container filesystem to tar (rootfs)
 		rootfsPath := filepath.Join(templateArtifactsDir, "rootfs.tar")
 		exportCmd := exec.CommandContext(ctx, "docker", "export", sandboxID, "-o", rootfsPath)
@@ -339,7 +344,7 @@ func (s *Service) processBuild(build *Build) {
 				sizeMB := float64(fi.Size()) / (1024 * 1024)
 				s.addLog(build, LogLevelInfo, fmt.Sprintf("Rootfs exported: %.1f MB", sizeMB), nil)
 			}
-			
+
 			// Also save image tar (for future use with VM snapshots)
 			imagePath := filepath.Join(templateArtifactsDir, "image.tar")
 			saveCmd := exec.CommandContext(ctx, "docker", "save", imageTag, "-o", imagePath)
@@ -351,7 +356,7 @@ func (s *Service) processBuild(build *Build) {
 					s.addLog(build, LogLevelInfo, fmt.Sprintf("Image saved: %.1f MB", sizeMB), nil)
 				}
 			}
-			
+
 			// Write metadata
 			metadataPath := filepath.Join(templateArtifactsDir, "metadata.json")
 			metadata := map[string]interface{}{
@@ -366,7 +371,15 @@ func (s *Service) processBuild(build *Build) {
 			if data, err := json.MarshalIndent(metadata, "", "  "); err == nil {
 				os.WriteFile(metadataPath, data, 0644)
 			}
-			
+
+			// Create Firecracker-ready ext4 rootfs with envd injected
+			s.addLog(build, LogLevelInfo, "Creating Firecracker-ready rootfs...", nil)
+			if err := s.createFirecrackerRootfs(ctx, rootfsPath, templateArtifactsDir, build); err != nil {
+				s.addLog(build, LogLevelWarn, fmt.Sprintf("Failed to create Firecracker rootfs: %v", err), nil)
+			} else {
+				s.addLog(build, LogLevelInfo, "Firecracker rootfs created with envd injected", nil)
+			}
+
 			s.addLog(build, LogLevelInfo, fmt.Sprintf("Artifacts saved to: %s", templateArtifactsDir), nil)
 		}
 	}
@@ -530,4 +543,157 @@ func toDBLogEntries(entries []LogEntry) []db.LogEntry {
 		}
 	}
 	return result
+}
+
+// createFirecrackerRootfs converts a tar rootfs to ext4 and injects envd for Firecracker VMs
+func (s *Service) createFirecrackerRootfs(ctx context.Context, tarPath, artifactsDir string, build *Build) error {
+	ext4Path := filepath.Join(artifactsDir, "rootfs.ext4")
+
+	// Default size: 2GB, can be configured based on build requirements
+	sizeMB := 2048
+	if build.MemoryMB > 512 {
+		// Scale disk size with memory for larger builds
+		sizeMB = build.MemoryMB * 4
+	}
+
+	// Create sparse file for ext4 filesystem
+	ddCmd := exec.CommandContext(ctx, "dd", "if=/dev/zero", "of="+ext4Path, "bs=1M", "count=0", fmt.Sprintf("seek=%d", sizeMB))
+	if out, err := ddCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("dd failed: %s: %w", string(out), err)
+	}
+
+	// Format as ext4
+	mkfsCmd := exec.CommandContext(ctx, "mkfs.ext4", "-F", ext4Path)
+	if out, err := mkfsCmd.CombinedOutput(); err != nil {
+		os.Remove(ext4Path)
+		return fmt.Errorf("mkfs.ext4 failed: %s: %w", string(out), err)
+	}
+
+	// Mount the ext4 filesystem
+	mountPoint := ext4Path + ".mount"
+	os.MkdirAll(mountPoint, 0755)
+	defer os.RemoveAll(mountPoint)
+
+	mountCmd := exec.CommandContext(ctx, "mount", "-o", "loop", ext4Path, mountPoint)
+	if out, err := mountCmd.CombinedOutput(); err != nil {
+		os.Remove(ext4Path)
+		return fmt.Errorf("mount failed: %s: %w", string(out), err)
+	}
+	defer exec.CommandContext(ctx, "umount", mountPoint).Run()
+
+	// Extract the tar archive into the ext4 filesystem
+	tarCmd := exec.CommandContext(ctx, "tar", "-xf", tarPath, "-C", mountPoint)
+	if out, err := tarCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tar extract failed: %s: %w", string(out), err)
+	}
+
+	// Ensure essential directories exist
+	essentialDirs := []string{"proc", "sys", "dev", "run", "tmp", "var/log", "usr/local/bin", "etc/init.d"}
+	for _, dir := range essentialDirs {
+		os.MkdirAll(filepath.Join(mountPoint, dir), 0755)
+	}
+
+	// Find and inject envd binary
+	envdPath := findEnvdBinary()
+	if envdPath != "" {
+		envdDst := filepath.Join(mountPoint, "usr", "local", "bin", "envd")
+		cpCmd := exec.CommandContext(ctx, "cp", envdPath, envdDst)
+		if out, err := cpCmd.CombinedOutput(); err != nil {
+			log.Printf("[build] Warning: failed to copy envd: %s: %v", string(out), err)
+		} else {
+			os.Chmod(envdDst, 0755)
+			log.Printf("[build] Injected envd binary into rootfs")
+		}
+	}
+
+	// Create network and envd startup script
+	rcLocalPath := filepath.Join(mountPoint, "etc", "rc.local")
+	rcLocalContent := `#!/bin/sh
+# E2B Sandbox Network and envd Configuration
+
+# Configure network interfaces
+ip link set lo up
+ip link set eth0 up 2>/dev/null || true
+
+# Try DHCP first, fallback to static IP
+dhclient eth0 2>/dev/null || {
+    ip addr add 192.168.100.2/24 dev eth0 2>/dev/null || true
+    ip route add default via 192.168.100.1 2>/dev/null || true
+}
+
+# Start envd daemon
+export E2B_ENVD_PORT=49983
+if [ -x /usr/local/bin/envd ]; then
+    /usr/local/bin/envd > /var/log/envd.log 2>&1 &
+    echo "envd started on port $E2B_ENVD_PORT"
+fi
+
+exit 0
+`
+	if err := os.WriteFile(rcLocalPath, []byte(rcLocalContent), 0755); err != nil {
+		log.Printf("[build] Warning: failed to write rc.local: %v", err)
+	}
+
+	// Create systemd service for envd (for systems with systemd)
+	systemdDir := filepath.Join(mountPoint, "etc", "systemd", "system")
+	os.MkdirAll(systemdDir, 0755)
+
+	envdServicePath := filepath.Join(systemdDir, "envd.service")
+	envdServiceContent := `[Unit]
+Description=E2B Environment Daemon
+After=network.target
+
+[Service]
+Type=simple
+Environment=E2B_ENVD_PORT=49983
+ExecStart=/usr/local/bin/envd
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target
+`
+	os.WriteFile(envdServicePath, []byte(envdServiceContent), 0644)
+
+	// Enable envd service (create symlink)
+	wantsDir := filepath.Join(systemdDir, "multi-user.target.wants")
+	os.MkdirAll(wantsDir, 0755)
+	os.Symlink("../envd.service", filepath.Join(wantsDir, "envd.service"))
+
+	// Get final size
+	if fi, err := os.Stat(ext4Path); err == nil {
+		sizeMB := float64(fi.Size()) / (1024 * 1024)
+		log.Printf("[build] Created Firecracker rootfs: %.1f MB", sizeMB)
+	}
+
+	return nil
+}
+
+// findEnvdBinary locates the envd binary for injection
+func findEnvdBinary() string {
+	// Try common locations
+	locations := []string{
+		"/opt/e2b/bin/envd",
+		"bin/envd",
+		"bin/envd-linux-amd64",
+		"bin/envd-linux-arm64",
+		"./envd",
+	}
+
+	for _, loc := range locations {
+		if _, err := os.Stat(loc); err == nil {
+			return loc
+		}
+	}
+
+	// Try looking relative to executable
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		envdPath := filepath.Join(dir, "envd")
+		if _, err := os.Stat(envdPath); err == nil {
+			return envdPath
+		}
+	}
+
+	return ""
 }

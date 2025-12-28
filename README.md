@@ -64,34 +64,36 @@ The main entry point for all client interactions. Provides REST/JSON APIs compat
 // internal/api/handlers.go
 type Handler struct {
     store        *Store
-    scheduler    *orchestrator.Scheduler
+    scheduler    *scheduler.Scheduler
     buildService BuildService
 }
 ```
 
-### 2. Orchestrator (`internal/orchestrator`)
+### 2. Scheduler (`internal/scheduler`)
 
-Manages sandbox placement and lifecycle across compute nodes.
+Manages sandbox placement and lifecycle across compute nodes (Control Plane logic).
 
 **Components:**
 
 - **Scheduler** - Selects optimal nodes and manages sandbox state
-- **DockerNode** - In-process Docker execution (local development)
-- **GRPCNode** - Remote node communication via gRPC
+- **DockerRuntime** - In-process Docker execution (local development)
+- **OrchestratorClient** - Remote node communication via gRPC
 
 ```go
 // NodeOperations interface - implement for new runtimes
 type NodeOperations interface {
-    CreateSandbox(ctx context.Context, node *Node, spec SandboxSpec) error
+    CreateSandbox(ctx context.Context, node *Node, spec SandboxSpec) (*SandboxResult, error)
     StopSandbox(ctx context.Context, node *Node, sandboxID string) error
     PauseSandbox(ctx context.Context, node *Node, sandboxID string) error
     ResumeSandbox(ctx context.Context, node *Node, sandboxID string) error
+    GetSandboxHost(sandboxID string) (host string, port int, ok bool)
 }
 ```
 
-### 3. Node Agent (`cmd/node-agent`)
+### 3. Orchestrator (`cmd/orchestrator`)
 
 Runs on compute nodes to manage sandboxes. Communicates with API server via gRPC.
+(Formerly called "node-agent", renamed to align with E2B BYOC terminology)
 
 **Supported Runtimes:**
 
@@ -99,8 +101,8 @@ Runs on compute nodes to manage sandboxes. Communicates with API server via gRPC
 - `FirecrackerRuntime` - Firecracker microVMs (Linux with KVM only)
 
 ```bash
-# Run node agent
-./node-agent --listen :9000 --runtime docker --artifacts-dir ./data/artifacts
+# Run orchestrator (node daemon)
+./orchestrator --listen :9000 --runtime docker --artifacts-dir ./data/artifacts
 ```
 
 ### 4. envd Daemon (`cmd/envd`)
@@ -145,8 +147,11 @@ Handles template image building using Docker.
 
 ```bash
 # Build all binaries
-go build -o ./api ./cmd/api/main.go
-go build -o ./node-agent ./cmd/node-agent/main.go
+make build
+
+# Or individually:
+go build -o ./bin/api ./cmd/api/main.go
+go build -o ./bin/orchestrator ./cmd/orchestrator/main.go
 GOOS=linux GOARCH=amd64 go build -o ./bin/envd-linux-amd64 ./cmd/envd/main.go
 ```
 
@@ -307,19 +312,20 @@ curl -X POST http://localhost:3000/sandboxes/{sandboxID}/resume \
 ```
 E2B-server/
 ├── cmd/
-│   ├── api/              # API server entry point
+│   ├── api/              # API server entry point (Control Plane)
+│   ├── orchestrator/     # Orchestrator daemon (Node Daemon)
+│   ├── edge-controller/  # Edge Controller (standalone proxy)
 │   ├── envd/             # envd daemon entry point
-│   ├── node-agent/       # Node agent entry point
 │   └── migrate/          # Database migration tool
 ├── internal/
 │   ├── api/              # HTTP handlers, models, router
 │   ├── auth/             # Authentication middleware
 │   ├── build/            # Template build service
 │   ├── db/               # Database layer (memory, postgres, supabase)
-│   ├── orchestrator/     # Scheduler, node operations, types
-│   ├── agent/            # Node agent implementation
+│   ├── scheduler/        # Scheduler, node operations, types
+│   ├── agent/            # Orchestrator agent implementation
 │   ├── firecracker/      # Firecracker VM support (WIP)
-│   └── proxy/            # Network proxy router
+│   └── proxy/            # Edge Controller proxy router
 ├── pkg/
 │   ├── envd/             # envd services (filesystem, process)
 │   └── proto/            # Generated protobuf/connect code
@@ -350,16 +356,63 @@ E2B-server/
 
 ### SDK Configuration (Local Development)
 
-```bash
-# JavaScript/TypeScript
-export E2B_API_URL=http://localhost:3000
-export E2B_SANDBOX_URL=http://localhost:49983
-export E2B_API_KEY=e2b_test_key
+See [research/005-local-development-modes.md](research/005-local-development-modes.md) for detailed documentation.
 
-# Python
+| Mode | Commands | Files | Multi-Sandbox | Setup Required |
+|------|----------|-------|---------------|----------------|
+| Debug Mode | ✅ | ✅ | ❌ | None |
+| Proxy Mode | ✅ | ❌ | ✅ | None |
+| DNS Mode | ✅ | ✅ | ✅ | dnsmasq |
+
+#### Option A: Debug Mode (Easiest - Single Sandbox)
+
+Best for quick testing with full SDK functionality:
+
+```bash
 export E2B_API_URL=http://localhost:3000
-export E2B_SANDBOX_URL=http://localhost:49983
 export E2B_API_KEY=e2b_test_key
+export E2B_DOMAIN=e2b.local
+export E2B_DEBUG=true
+
+# Test: npx tsx test-sdk/debug_mode_test.ts
+```
+
+**Limitation:** Only ONE sandbox at a time (SDK connects to localhost:49983).
+
+#### Option B: Proxy Mode (Multi-Sandbox Commands Only)
+
+For testing multiple sandboxes with command execution:
+
+```bash
+export E2B_API_URL=http://localhost:3000
+export E2B_API_KEY=e2b_test_key
+export E2B_DOMAIN=e2b.local
+export E2B_SANDBOX_URL=http://localhost:8080
+
+# Test: npx tsx test-sdk/sdk_test.ts
+```
+
+**Limitation:** `sandbox.files.*` operations don't work (SDK REST client doesn't include routing headers).
+
+#### Option C: DNS Mode (Full Features - Requires Setup)
+
+For complete SDK compatibility with multi-sandbox:
+
+```bash
+# Setup DNS (one-time, requires sudo)
+sudo ./scripts/setup-local-dns.sh
+sudo brew services start dnsmasq
+sudo dscacheutil -flushcache
+
+# Start API server on port 80 (for HTTP)
+sudo E2B_PROXY_PORT=80 ./bin/api
+
+# Configure SDK (do NOT set E2B_SANDBOX_URL or E2B_DEBUG)
+export E2B_API_URL=http://localhost:3000
+export E2B_API_KEY=e2b_test_key
+export E2B_DOMAIN=e2b.local
+
+# Test: npx tsx test-sdk/dns_mode_test.ts
 ```
 
 ---

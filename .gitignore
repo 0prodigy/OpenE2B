@@ -1,5 +1,7 @@
 /data
 /bin
 /.cursor
-/test-sdk
 /.env
+/test-sdk
+/research/
+/scripts/

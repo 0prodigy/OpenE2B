@@ -1,4 +1,4 @@
-package orchestrator
+package scheduler
 
 import (
 	"context"
@@ -8,13 +8,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DockerNode implements NodeOperations using local Docker CLI.
+// DockerRuntime implements NodeOperations using local Docker CLI.
 // This is used for in-process execution when the API and compute run together.
-type DockerNode struct {
-	// envdPort is the default port for envd in sandboxes
+type DockerRuntime struct {
+	mu sync.RWMutex
+
+	// envdPort is the default port for envd inside containers
 	envdPort int
 	// envdBinaryPath is the path to the envd binary to inject into containers
 	envdBinaryPath string
@@ -26,8 +29,8 @@ type DockerNode struct {
 	nextNewPort int
 }
 
-// NewDockerNode creates a new Docker-based node operations handler
-func NewDockerNode() *DockerNode {
+// NewDockerRuntime creates a new Docker-based runtime
+func NewDockerRuntime() *DockerRuntime {
 	// Try to find the envd binary
 	envdPath := findEnvdBinary()
 	if envdPath != "" {
@@ -36,7 +39,7 @@ func NewDockerNode() *DockerNode {
 		log.Printf("[docker] Warning: envd binary not found, sandboxes will run without envd")
 	}
 
-	return &DockerNode{
+	return &DockerRuntime{
 		envdPort:       49983,
 		envdBinaryPath: envdPath,
 		sandboxPorts:   make(map[string]int),
@@ -46,22 +49,22 @@ func NewDockerNode() *DockerNode {
 }
 
 // allocatePort returns an available port for a new sandbox
-func (n *DockerNode) allocatePort() int {
+func (d *DockerRuntime) allocatePort() int {
 	// Try to reuse an available port first
-	if len(n.availablePorts) > 0 {
-		port := n.availablePorts[0]
-		n.availablePorts = n.availablePorts[1:]
+	if len(d.availablePorts) > 0 {
+		port := d.availablePorts[0]
+		d.availablePorts = d.availablePorts[1:]
 		return port
 	}
 	// Otherwise allocate a new port
-	port := n.nextNewPort
-	n.nextNewPort++
+	port := d.nextNewPort
+	d.nextNewPort++
 	return port
 }
 
 // releasePort returns a port to the available pool
-func (n *DockerNode) releasePort(port int) {
-	n.availablePorts = append(n.availablePorts, port)
+func (d *DockerRuntime) releasePort(port int) {
+	d.availablePorts = append(d.availablePorts, port)
 }
 
 // findEnvdBinary looks for the envd binary in common locations
@@ -69,7 +72,9 @@ func findEnvdBinary() string {
 	// Check common locations
 	paths := []string{
 		"./bin/envd-linux-amd64",
+		"./bin/envd",
 		"./envd-linux-amd64",
+		"./envd",
 		"/usr/local/bin/envd",
 	}
 
@@ -86,7 +91,10 @@ func findEnvdBinary() string {
 	return ""
 }
 
-func (n *DockerNode) CreateSandbox(ctx context.Context, node *Node, spec SandboxSpec) error {
+func (d *DockerRuntime) CreateSandbox(ctx context.Context, node *Node, spec SandboxSpec) (*SandboxResult, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	// Determine the image to use:
 	// 1. If BuildID is set, use e2b/{templateID}:{buildID}
 	// 2. Otherwise use the template ID as image name
@@ -123,11 +131,10 @@ func (n *DockerNode) CreateSandbox(ctx context.Context, node *Node, spec Sandbox
 		args = append(args, fmt.Sprintf("-m=%dm", spec.MemoryMB))
 	}
 
-	// Port mapping for envd - use a predictable host port for local development
-	// Allocate a port (reusing if available)
-	hostPort := n.allocatePort()
-	n.sandboxPorts[spec.ID] = hostPort
-	args = append(args, "-p", fmt.Sprintf("%d:%d", hostPort, n.envdPort))
+	// Port mapping for envd - allocate a unique host port
+	hostPort := d.allocatePort()
+	d.sandboxPorts[spec.ID] = hostPort
+	args = append(args, "-p", fmt.Sprintf("%d:%d", hostPort, d.envdPort))
 
 	// Environment variables
 	for key, value := range spec.EnvVars {
@@ -138,7 +145,7 @@ func (n *DockerNode) CreateSandbox(ctx context.Context, node *Node, spec Sandbox
 	if spec.EnvdToken != "" {
 		args = append(args, "-e", fmt.Sprintf("E2B_ACCESS_TOKEN=%s", spec.EnvdToken))
 	}
-	args = append(args, "-e", fmt.Sprintf("E2B_ENVD_PORT=%d", n.envdPort))
+	args = append(args, "-e", fmt.Sprintf("E2B_ENVD_PORT=%d", d.envdPort))
 
 	// Working directory
 	args = append(args, "-w", "/home/user")
@@ -150,26 +157,31 @@ func (n *DockerNode) CreateSandbox(ctx context.Context, node *Node, spec Sandbox
 
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("docker run failed: %s: %w", string(out), err)
+		d.releasePort(hostPort)
+		delete(d.sandboxPorts, spec.ID)
+		return nil, fmt.Errorf("docker run failed: %s: %w", string(out), err)
 	}
 
-	log.Printf("[docker] Sandbox %s created with image %s", spec.ID, image)
+	log.Printf("[docker] Sandbox %s created with image %s on port %d", spec.ID, image, hostPort)
 
 	// Inject and start envd if binary is available
-	if n.envdBinaryPath != "" {
-		if err := n.injectAndStartEnvd(ctx, spec.ID, spec.EnvdToken); err != nil {
+	if d.envdBinaryPath != "" {
+		if err := d.injectAndStartEnvd(ctx, spec.ID, spec.EnvdToken); err != nil {
 			log.Printf("[docker] Warning: failed to start envd in sandbox %s: %v", spec.ID, err)
 			// Don't fail the sandbox creation, envd is optional for basic operations
 		}
 	}
 
-	return nil
+	return &SandboxResult{
+		HostPort: hostPort,
+		EnvdPort: d.envdPort,
+	}, nil
 }
 
 // injectAndStartEnvd copies the envd binary into the container and starts it
-func (n *DockerNode) injectAndStartEnvd(ctx context.Context, sandboxID, envdToken string) error {
+func (d *DockerRuntime) injectAndStartEnvd(ctx context.Context, sandboxID, envdToken string) error {
 	// Copy envd binary into container
-	copyCmd := exec.CommandContext(ctx, "docker", "cp", n.envdBinaryPath, fmt.Sprintf("%s:/usr/local/bin/envd", sandboxID))
+	copyCmd := exec.CommandContext(ctx, "docker", "cp", d.envdBinaryPath, fmt.Sprintf("%s:/usr/local/bin/envd", sandboxID))
 	if out, err := copyCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to copy envd binary: %s: %w", string(out), err)
 	}
@@ -186,7 +198,7 @@ func (n *DockerNode) injectAndStartEnvd(ctx context.Context, sandboxID, envdToke
 		"exec", "-d", sandboxID,
 		"/bin/sh", "-c",
 		fmt.Sprintf("E2B_ACCESS_TOKEN=%s E2B_ENVD_PORT=%d /usr/local/bin/envd > /var/log/envd.log 2>&1",
-			envdToken, n.envdPort),
+			envdToken, d.envdPort),
 	}
 
 	startCmd := exec.CommandContext(ctx, "docker", startArgs...)
@@ -206,25 +218,28 @@ func (n *DockerNode) injectAndStartEnvd(ctx context.Context, sandboxID, envdToke
 		return fmt.Errorf("envd not running, log: %s", string(logOut))
 	}
 
-	log.Printf("[docker] envd started in sandbox %s on port %d", sandboxID, n.envdPort)
+	log.Printf("[docker] envd started in sandbox %s on port %d", sandboxID, d.envdPort)
 	return nil
 }
 
-func (n *DockerNode) StopSandbox(ctx context.Context, node *Node, sandboxID string) error {
+func (d *DockerRuntime) StopSandbox(ctx context.Context, node *Node, sandboxID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	log.Printf("[docker] Stopping sandbox: %s", sandboxID)
 	cmd := exec.CommandContext(ctx, "docker", "rm", "-f", sandboxID)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("docker rm failed: %s: %w", string(out), err)
 	}
 	// Release port back to the pool
-	if port, ok := n.sandboxPorts[sandboxID]; ok {
-		n.releasePort(port)
-		delete(n.sandboxPorts, sandboxID)
+	if port, ok := d.sandboxPorts[sandboxID]; ok {
+		d.releasePort(port)
+		delete(d.sandboxPorts, sandboxID)
 	}
 	return nil
 }
 
-func (n *DockerNode) PauseSandbox(ctx context.Context, node *Node, sandboxID string) error {
+func (d *DockerRuntime) PauseSandbox(ctx context.Context, node *Node, sandboxID string) error {
 	log.Printf("[docker] Pausing sandbox: %s", sandboxID)
 	cmd := exec.CommandContext(ctx, "docker", "pause", sandboxID)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -233,7 +248,7 @@ func (n *DockerNode) PauseSandbox(ctx context.Context, node *Node, sandboxID str
 	return nil
 }
 
-func (n *DockerNode) ResumeSandbox(ctx context.Context, node *Node, sandboxID string) error {
+func (d *DockerRuntime) ResumeSandbox(ctx context.Context, node *Node, sandboxID string) error {
 	log.Printf("[docker] Resuming sandbox: %s", sandboxID)
 	cmd := exec.CommandContext(ctx, "docker", "unpause", sandboxID)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -242,8 +257,20 @@ func (n *DockerNode) ResumeSandbox(ctx context.Context, node *Node, sandboxID st
 	return nil
 }
 
+// GetSandboxHost returns the host and port for a sandbox (for proxy routing)
+func (d *DockerRuntime) GetSandboxHost(sandboxID string) (host string, port int, ok bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	port, ok = d.sandboxPorts[sandboxID]
+	if !ok {
+		return "", 0, false
+	}
+	return "localhost", port, true
+}
+
 // GetSandboxStatus returns the status of a sandbox by inspecting the container
-func (n *DockerNode) GetSandboxStatus(ctx context.Context, node *Node, sandboxID string) (*SandboxStatus, error) {
+func (d *DockerRuntime) GetSandboxStatus(ctx context.Context, sandboxID string) (*SandboxStatus, error) {
 	cmd := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Status}}", sandboxID)
 	out, err := cmd.Output()
 	if err != nil {
@@ -263,46 +290,13 @@ func (n *DockerNode) GetSandboxStatus(ctx context.Context, node *Node, sandboxID
 		state = SandboxStateError
 	}
 
-	// Get the mapped envd port
-	envdPort := n.getEnvdPort(ctx, sandboxID)
+	d.mu.RLock()
+	envdPort := d.sandboxPorts[sandboxID]
+	d.mu.RUnlock()
 
 	return &SandboxStatus{
 		State:    state,
-		NodeID:   node.Spec.ID,
-		EnvdPort: envdPort,
+		HostPort: envdPort,
+		EnvdPort: d.envdPort,
 	}, nil
-}
-
-// getEnvdPort returns the host port mapped to the envd port in the container
-func (n *DockerNode) getEnvdPort(ctx context.Context, sandboxID string) int {
-	// First check our cache
-	if port, ok := n.sandboxPorts[sandboxID]; ok {
-		return port
-	}
-
-	// Fallback to docker port command
-	cmd := exec.CommandContext(ctx, "docker", "port", sandboxID, fmt.Sprintf("%d/tcp", n.envdPort))
-	out, err := cmd.Output()
-	if err != nil {
-		return 0
-	}
-
-	// Output format is "0.0.0.0:XXXXX" or "[::]:XXXXX"
-	portStr := strings.TrimSpace(string(out))
-	parts := strings.Split(portStr, ":")
-	if len(parts) >= 2 {
-		var port int
-		fmt.Sscanf(parts[len(parts)-1], "%d", &port)
-		return port
-	}
-
-	return 0
-}
-
-// GetEnvdHostPort returns the host port for a sandbox (for API responses)
-func (n *DockerNode) GetEnvdHostPort(sandboxID string) int {
-	if port, ok := n.sandboxPorts[sandboxID]; ok {
-		return port
-	}
-	return n.envdPort
 }
