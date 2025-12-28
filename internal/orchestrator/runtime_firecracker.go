@@ -1,7 +1,7 @@
 //go:build linux
 // +build linux
 
-package agent
+package orchestrator
 
 import (
 	"bytes"

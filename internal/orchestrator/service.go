@@ -1,4 +1,4 @@
-package agent
+package orchestrator
 
 import (
 	"context"
@@ -87,6 +87,8 @@ func New(config Config) (*Agent, error) {
 		runtime = NewDockerRuntime(config.ArtifactsDir, config.SandboxesDir)
 	case "firecracker":
 		runtime = NewFirecrackerRuntime(config.ArtifactsDir, config.SandboxesDir)
+	case "docker-sdk":
+		runtime = NewDockerRuntimeSDK(config.ArtifactsDir, config.SandboxesDir)
 	default:
 		return nil, fmt.Errorf("unknown runtime mode: %s", config.RuntimeMode)
 	}
@@ -174,7 +176,6 @@ func (a *Agent) CreateSandbox(ctx context.Context, req *connect.Request[pb.Creat
 
 	return connect.NewResponse(&pb.CreateSandboxResponse{
 		Success:     true,
-		EnvdAddress: info.EnvdAddress,
 		EnvdPort:    info.EnvdPort,
 	}), nil
 }

@@ -1,4 +1,4 @@
-package agent
+package orchestrator
 
 import (
 	"bufio"
@@ -30,6 +30,7 @@ type dockerSandbox struct {
 	startedAt time.Time
 	expiresAt time.Time
 	envdPort  int32
+	envdAddress string
 }
 
 // NewDockerRuntime creates a new Docker-based runtime

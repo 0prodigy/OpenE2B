@@ -19,10 +19,9 @@ import (
 
 	"github.com/0prodigy/OpenE2B/internal/api"
 	"github.com/0prodigy/OpenE2B/internal/auth"
-	"github.com/0prodigy/OpenE2B/internal/build"
 	"github.com/0prodigy/OpenE2B/internal/db"
-	"github.com/0prodigy/OpenE2B/internal/proxy"
 	"github.com/0prodigy/OpenE2B/internal/scheduler"
+	"github.com/0prodigy/OpenE2B/internal/templatebuild"
 )
 
 func main() {
@@ -118,7 +117,7 @@ func main() {
 	} else {
 		go func() {
 			// start binary /orchestrator with docker runtime and start heartbeat in background
-			cmd := exec.Command("./bin/orchestrator", "-node-id", "local-node-1", "-runtime", "docker", "-edge-listen", ":9001")
+			cmd := exec.Command("./bin/c", "-node-id", "local-node-1", "-runtime", "docker-sdk", "-edge-listen", ":9001")
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			err := cmd.Run()
@@ -156,10 +155,29 @@ func main() {
 
 	// Initialize build service with artifacts directory
 	artifactsDir := filepath.Join("data", "artifacts")
-	buildSvc := build.NewService(dbStore, sched, imageManager, config.Domain, artifactsDir, 2)
+	buildSvc := templatebuild.NewService(dbStore, sched, imageManager, config.Domain, artifactsDir, 2)
 	defer buildSvc.Stop()
 	log.Printf("  Build Service: Started with 2 workers")
 	log.Printf("  Artifacts Dir: %s", artifactsDir)
+
+	// build base template
+	templateRec, ok := store.GetTemplate("base")
+	if !ok {
+		log.Fatalf("Failed to get base template")
+	}
+	err = buildSvc.StartBuild(context.Background(), templateRec.TemplateID, templateRec.BuildID, &templatebuild.Config{
+		FromImage: "ubuntu:22.04",
+		// FromTemplate:     "base",
+		Steps: []templatebuild.Step{
+			{
+				Type: "RUN",
+				Args: []string{"echo", "Hello, World!"},
+			},
+		},
+	})
+	if err != nil {
+		log.Fatalf("Failed to start build for base template: %v", err)
+	}
 
 	// Start sandbox expiration checker
 	sched.StartExpirationChecker(context.Background())
@@ -198,22 +216,19 @@ func main() {
 	}()
 
 	// Start local proxy server for SDK sandbox traffic
-	// This proxy routes SDK requests to sandbox envd instances
+	// This proxy routes SDK requests to the Edge Controller (embedded in orchestrator)
 	var proxyServer *http.Server
 	if config.ProxyPort > 0 {
-		var proxyHandler http.Handler
-
-		if config.EdgeControllerURL != "" {
-			// Mode 1: Remote Edge Controller - forward to external Edge Controller
-			proxyHandler = newEdgeControllerProxy(config.EdgeControllerURL, config.Domain)
-			log.Printf("  Proxy Mode: Forwarding to Edge Controller at %s", config.EdgeControllerURL)
-		} else {
-			// Mode 2: Local Docker Runtime - route directly to sandbox containers
-			// Create a lookup adapter that uses the scheduler's Docker runtime
-			lookup := &schedulerLookup{sched: sched, nodeOps: nodeOps}
-			proxyHandler = proxy.NewRouter(config.Domain, config.EnvdPort, lookup)
-			log.Printf("  Proxy Mode: Local Docker Runtime (direct routing)")
+		// Determine Edge Controller URL
+		// - If explicitly set via E2B_EDGE_CONTROLLER_URL, use that
+		// - Otherwise, use local orchestrator's edge controller on port 9001
+		edgeURL := config.EdgeControllerURL
+		if edgeURL == "" {
+			edgeURL = "http://localhost:9001"
 		}
+
+		proxyHandler := newEdgeControllerProxy(edgeURL, config.Domain)
+		log.Printf("  Proxy Mode: Forwarding to Edge Controller at %s", edgeURL)
 
 		proxyServer = &http.Server{
 			Addr:         fmt.Sprintf(":%d", config.ProxyPort),
@@ -457,54 +472,4 @@ type imageManager struct {
 
 func newImageManager(storage *localStorage, registryHost string) *imageManager {
 	return &imageManager{storage: storage, registryHost: registryHost}
-}
-
-// schedulerLookup adapts the scheduler to the proxy.SandboxLookup interface
-type schedulerLookup struct {
-	sched   *scheduler.Scheduler
-	nodeOps scheduler.NodeOperations
-}
-
-// GetSandboxHost implements proxy.SandboxLookup
-func (s *schedulerLookup) GetSandboxHost(sandboxID string) (host string, port int, state proxy.SandboxState, ok bool) {
-	// First check if sandbox exists in scheduler
-	sb, exists := s.sched.GetSandbox(sandboxID)
-	if !exists || sb == nil {
-		return "", 0, proxy.SandboxStateError, false
-	}
-
-	// Map scheduler state to proxy state
-	switch sb.Status.State {
-	case scheduler.SandboxStateRunning:
-		state = proxy.SandboxStateRunning
-	case scheduler.SandboxStatePaused:
-		state = proxy.SandboxStatePaused
-	case scheduler.SandboxStateStopped:
-		state = proxy.SandboxStateStopped
-	default:
-		state = proxy.SandboxStateError
-	}
-
-	// Get the actual host:port from the node operations
-	// For Docker runtime, this gets the allocated host port
-	if dockerRuntime, isDR := s.nodeOps.(*scheduler.DockerRuntime); isDR {
-		host, port, ok = dockerRuntime.GetSandboxHost(sandboxID)
-		return host, port, state, ok
-	}
-
-	// For remote orchestrators, use the OrchestratorClient which has the actual host
-	if orchestratorClient, isOC := s.nodeOps.(*scheduler.OrchestratorClient); isOC {
-		host, port, ok = orchestratorClient.GetSandboxHost(sandboxID)
-		return host, port, state, ok
-	}
-
-	// Fallback: look up the node's address by ID from the nodes list
-	for _, node := range s.sched.ListNodes() {
-		if node.Spec.ID == sb.Status.NodeID {
-			return node.Spec.Address, sb.Status.HostPort, state, true
-		}
-	}
-
-	// Last resort - return NodeID (might not work if not resolvable)
-	return sb.Status.NodeID, sb.Status.HostPort, state, true
 }

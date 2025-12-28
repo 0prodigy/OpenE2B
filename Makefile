@@ -11,12 +11,11 @@ GOFMT=$(GOCMD) fmt
 API_BINARY=bin/api
 ENVD_BINARY=bin/envd
 ORCHESTRATOR_BINARY=bin/orchestrator
-EDGE_CONTROLLER_BINARY=bin/edge-controller
 
 all: build
 
 # Build all binaries
-build: build-api build-envd build-orchestrator build-edge-controller
+build: build-api build-envd build-orchestrator
 
 build-api:
 	$(GOBUILD) -o $(API_BINARY) ./cmd/api
@@ -27,22 +26,15 @@ build-envd:
 build-orchestrator:
 	$(GOBUILD) -o $(ORCHESTRATOR_BINARY) ./cmd/orchestrator
 
-build-edge-controller:
-	$(GOBUILD) -o $(EDGE_CONTROLLER_BINARY) ./cmd/edge-controller
-
-# Run the API server (includes embedded Edge Controller)
+# Run the API server (starts orchestrator automatically in local mode)
 run-api: build-api
 	./$(API_BINARY)
 
-# Run the Orchestrator (Node Daemon)
+# Run the Orchestrator (Node Daemon) - for BYOC deployments
 run-orchestrator: build-orchestrator
 	./$(ORCHESTRATOR_BINARY)
 
-# Run the Edge Controller (standalone proxy)
-run-edge-controller: build-edge-controller
-	./$(EDGE_CONTROLLER_BINARY)
-
-# Run envd daemon
+# Run envd daemon (runs inside sandboxes)
 run-envd: build-envd
 	./$(ENVD_BINARY)
 
@@ -103,10 +95,11 @@ docker-run:
 
 # Build Linux binaries for deployment
 build-linux:
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -o bin/api-linux-amd64 ./cmd/api
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o bin/orchestrator-linux-amd64 ./cmd/orchestrator
 	GOOS=linux GOARCH=amd64 $(GOBUILD) -o bin/envd-linux-amd64 ./cmd/envd
-	GOOS=linux GOARCH=amd64 $(GOBUILD) -o bin/api-linux-amd64 ./cmd/api
-	GOOS=linux GOARCH=amd64 $(GOBUILD) -o bin/edge-controller-linux-amd64 ./cmd/edge-controller
+	GOOS=linux GOARCH=arm64 $(GOBUILD) -o bin/orchestrator-linux-arm64 ./cmd/orchestrator
+	GOOS=linux GOARCH=arm64 $(GOBUILD) -o bin/envd-linux-arm64 ./cmd/envd
 	@echo "✓ Linux binaries built"
 
 # Firecracker deployment
@@ -137,9 +130,8 @@ help:
 	@echo "Usage:"
 	@echo "  make build              - Build all binaries"
 	@echo "  make build-linux        - Build Linux binaries for deployment"
-	@echo "  make run-api            - Run API server with embedded Edge Controller"
-	@echo "  make run-orchestrator   - Run Orchestrator (Node Daemon)"
-	@echo "  make run-edge-controller - Run Edge Controller (standalone proxy)"
+	@echo "  make run-api            - Run API server (starts orchestrator in local mode)"
+	@echo "  make run-orchestrator   - Run Orchestrator standalone (for BYOC)"
 	@echo "  make run-envd           - Run envd daemon"
 	@echo "  make run-api-db         - Run API server (with database if DATABASE_URL set)"
 	@echo "  make test               - Run tests"
@@ -154,16 +146,17 @@ help:
 	@echo "  make logs-firecracker   - View remote orchestrator logs"
 	@echo ""
 	@echo "Components:"
-	@echo "  api            - Control Plane (API Server + Scheduler + embedded Edge Controller)"
-	@echo "  orchestrator   - Node Daemon (manages sandboxes on compute nodes)"
-	@echo "  edge-controller - Standalone proxy for SDK traffic routing"
+	@echo "  api            - Control Plane (API Server + Scheduler + Build Service)"
+	@echo "  orchestrator   - Node Daemon (manages sandboxes, includes Edge Controller)"
 	@echo "  envd           - Sandbox daemon (runs inside containers/VMs)"
 	@echo ""
 	@echo "Environment Variables:"
-	@echo "  DATABASE_URL      - PostgreSQL/Supabase connection string"
-	@echo "  E2B_DOMAIN        - Base domain (default: e2b.local)"
-	@echo "  E2B_API_PORT      - API port (default: 3000)"
-	@echo "  E2B_PROXY_PORT    - Edge Controller proxy port (default: 8080)"
-	@echo "  E2B_ENVD_PORT     - envd port inside sandboxes (default: 49983)"
-	@echo "  SSH_KEY           - SSH key for AWS deployment"
-	@echo "  EC2_HOST          - EC2 instance hostname"
+	@echo "  DATABASE_URL             - PostgreSQL/Supabase connection string"
+	@echo "  SUPABASE_URL             - Supabase project URL"
+	@echo "  SUPABASE_SECRET_KEY      - Supabase service role key"
+	@echo "  E2B_DOMAIN               - Base domain (default: e2b.local)"
+	@echo "  E2B_API_PORT             - API port (default: 3000)"
+	@echo "  E2B_PROXY_PORT           - Proxy port (default: 8080)"
+	@echo "  E2B_ENVD_PORT            - envd port inside sandboxes (default: 49983)"
+	@echo "  E2B_EDGE_CONTROLLER_URL  - Edge Controller URL (default: http://localhost:9001)"
+	@echo "  E2B_ORCHESTRATOR_NODES   - Remote orchestrator nodes (format: node-1=http://host:port)"

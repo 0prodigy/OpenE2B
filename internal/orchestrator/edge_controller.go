@@ -1,9 +1,9 @@
-// Package agent provides the edge controller for routing SDK traffic to sandboxes.
+// Package orchestrator provides the Edge Controller for routing SDK traffic to sandboxes.
 //
 // The Edge Controller runs on the same host as the VMs and can access them
 // directly via their internal IPs. It routes requests based on the E2b-Sandbox-Id
 // header to the correct sandbox's envd instance.
-package agent
+package orchestrator
 
 import (
 	"fmt"
@@ -84,7 +84,7 @@ func (e *EdgeController) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	// Use the VM's internal IP address from EnvdAddress (e.g., "192.168.100.2:49983")
 	// This is set by the Firecracker runtime when the VM is created
-	targetURL := fmt.Sprintf("http://%s", info.EnvdAddress)
+	targetURL := fmt.Sprintf("http://%s:%d", info.EnvdAddress, info.EnvdPort)
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		log.Printf("[edge-controller] Invalid target URL: %s", targetURL)

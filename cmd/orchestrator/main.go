@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/0prodigy/OpenE2B/internal/agent"
+	"github.com/0prodigy/OpenE2B/internal/orchestrator"
 	"github.com/0prodigy/OpenE2B/pkg/proto/node/nodeconnect"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -56,8 +56,8 @@ func main() {
 	os.MkdirAll(*artifactsDir, 0755)
 	os.MkdirAll(*sandboxesDir, 0755)
 
-	// Create the orchestrator agent
-	agentConfig := agent.Config{
+	// Create the orchestrator service
+	orchestratorConfig := orchestrator.Config{
 		NodeID:       *nodeID,
 		ArtifactsDir: *artifactsDir,
 		SandboxesDir: *sandboxesDir,
@@ -65,16 +65,16 @@ func main() {
 		ControlPlane: *controlPlane,
 	}
 
-	orchestratorAgent, err := agent.New(agentConfig)
+	orchestratorSvc, err := orchestrator.New(orchestratorConfig)
 	if err != nil {
-		log.Fatalf("Failed to create orchestrator agent: %v", err)
+		log.Fatalf("Failed to create orchestrator service: %v", err)
 	}
 
 	// Set up HTTP mux for Connect
 	mux := http.NewServeMux()
 
 	// Register the NodeAgent service (gRPC interface for control plane)
-	path, handler := nodeconnect.NewNodeAgentHandler(orchestratorAgent, connect.WithInterceptors())
+	path, handler := nodeconnect.NewNodeAgentHandler(orchestratorSvc, connect.WithInterceptors())
 	mux.Handle(path, handler)
 
 	// Health check endpoint
@@ -98,7 +98,7 @@ func main() {
 	}()
 
 	// Start Edge Controller for SDK traffic routing
-	edgeController := agent.NewEdgeController(orchestratorAgent.GetRuntime())
+	edgeController := orchestrator.NewEdgeController(orchestratorSvc.GetRuntime())
 	edgeServer := &http.Server{
 		Addr:    *edgeAddr,
 		Handler: edgeController,
@@ -113,7 +113,7 @@ func main() {
 
 	// Start heartbeat if control plane is configured
 	if *controlPlane != "" {
-		go orchestratorAgent.StartHeartbeat(context.Background())
+		go orchestratorSvc.StartHeartbeat(context.Background())
 	}
 
 	// Wait for shutdown signal
@@ -129,7 +129,7 @@ func main() {
 	// Shutdown both servers
 	server.Shutdown(ctx)
 	edgeServer.Shutdown(ctx)
-	orchestratorAgent.Shutdown()
+	orchestratorSvc.Shutdown()
 
 	log.Println("Shutdown complete")
 }
